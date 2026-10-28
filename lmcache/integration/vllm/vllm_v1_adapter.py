@@ -8523,7 +8523,7 @@ class LMCacheConnectorV1Impl:
             and getattr(request, "shared_index_skipped", False)
             and not getattr(request, "resumed_from_preemption", False)
             and getattr(request, "disagg_spec", None) is None
-            and len(self._kvcaches_for_group(1)) == self.num_layers
+            and len(self._kvcaches_for_group(1)) == self.lmcache_engine.num_layers_for_group(1)
             and not self._sparse_decode_requires_index_materialization(
                 request, shared_cpu_enabled=False
             )
