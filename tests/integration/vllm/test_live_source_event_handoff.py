@@ -503,7 +503,7 @@ def test_frontier_change_between_arm_and_capture_fails_closed() -> None:
     assert not hasattr(metadata, "_live_source_event_handoff")
 
 def test_direct_store_forwards_full_prefix_mapping_by_reference(
-    monkeypatch, sparse, prefix
+    monkeypatch, sparse, prefix, repair
 ):
     monkeypatch.setattr(
         adapter_mod, "_prepare_remote_fill_persistent_placement", lambda *a, **k: False
@@ -532,10 +532,12 @@ def test_direct_store_forwards_full_prefix_mapping_by_reference(
             store_direct_prefill=store,
         ),
     )
+    if repair is not None:
+        adapter.config.remote_fill_prefix_hole_repair = repair
     adapter_mod.LMCacheAscendConnectorV1Impl._submit_direct_prefill_requests(
         adapter, [req], finish_batch=True, source_ready_events=(object(),)
     )
     assert store.call_args.args[3] is windows
-    expected = {0: full0, 1: full1} if prefix and not sparse else None
+    expected = {0: full0, 1: full1} if repair and prefix and not sparse else None
     assert store.call_args.kwargs["prefix_slot_mappings"] == expected
     assert store.call_args.kwargs["slot_mapping_base"] == 1024
