@@ -1784,7 +1784,8 @@ def test_standalone_connector_injects_destination_dp_identity() -> None:
 def test_engine_close_reaches_allocator_after_safe_remote_fill_shutdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._force_layerwise_prefill_store = False
     base_close_calls = 0
 
     class _SafeRuntime:
@@ -1797,12 +1798,12 @@ def test_engine_close_reaches_allocator_after_safe_remote_fill_shutdown(
 
     monkeypatch.setattr(LMCacheEngine, "close", base_close)
     monkeypatch.setattr(
-        LMCacheEngine,
+        AscendLMCacheEngine,
         "close_remote_fill_producer",
         lambda self: None,
     )
     monkeypatch.setattr(
-        LMCacheEngine,
+        AscendLMCacheEngine,
         "wait_for_direct_stores",
         lambda self, states: None,
     )
