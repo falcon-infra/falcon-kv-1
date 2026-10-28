@@ -1564,6 +1564,8 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
 
         if cached_chunk_ptrs_npu is None:
             return
+        if self._is_deferred_sparse_pointer_cache(cached_chunk_ptrs_npu):
+            return
 
         new_ptrs_npu = torch.tensor(
             new_dev_ptrs, dtype=torch.long, device=self.kv_device
@@ -1756,6 +1758,9 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         new_count = old_count + suffix_count
         for layer_id in range(num_layers):
             cached_chunk_dev_ptrs[layer_id].extend(staged_rows[layer_id])
+
+        if self._is_deferred_sparse_pointer_cache(cached_chunk_ptrs_npu):
+            return
 
         table_ms = unbind_ms = 0.0
         if cached_chunk_ptrs_npu is not None:
@@ -3073,6 +3078,12 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             if expected_num_chunks is None
             else expected_num_chunks
         )
+        if self._is_deferred_sparse_pointer_cache(cached_chunk_ptrs_npu):
+            if cached_chunk_dev_ptrs is None:
+                raise RuntimeError("Deferred sparse pointer cache has no host rows")
+            self.materialize_sparse_chunk_ptr_cache(
+                cached_chunk_dev_ptrs, cached_chunk_ptrs_npu
+            )
         if cached_chunk_ptrs_npu is not None and layer_id < len(cached_chunk_ptrs_npu):
             cached = cached_chunk_ptrs_npu[layer_id]
             if cached is not None and cached.numel() == num_chunks:
@@ -7550,6 +7561,118 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         self._prefill_dma_bound_loads.pop(req_id, None)
         self._prefill_dma_slot_snapshots.pop(req_id, None)
         self._prefill_dma_bank_offsets.pop(req_id, None)
+
+    def release_sparse_chunk_ptr_cache(
+        self,
+        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
+    ) -> None:
+        """Release request-local amortized pointer-table backing storage."""
+        if cached_chunk_ptrs_npu is None:
+            return
+        deferred = getattr(self, "_deferred_sparse_pointer_caches", None)
+        if deferred is not None:
+            deferred.pop(id(cached_chunk_ptrs_npu), None)
+        tables = getattr(self, "_layerwise_pointer_tables", None)
+        if not tables:
+            return
+        identity = id(cached_chunk_ptrs_npu)
+        for key in tuple(tables):
+            key_identity = key[0] if isinstance(key, tuple) else key
+            if key_identity == identity:
+                tables.pop(key, None)
+
+    def materialize_sparse_chunk_ptr_cache(
+        self,
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: List[Optional[torch.Tensor]],
+        *,
+        kv_group: Optional[int] = None,
+        defer_copy: bool = False,
+    ) -> None:
+        """Materialize a deferred source table once, before sparse consumption."""
+        if not self._is_deferred_sparse_pointer_cache(cached_chunk_ptrs_npu):
+            return
+        num_layers = len(cached_chunk_dev_ptrs)
+        if kv_group is not None and num_layers != self._expected_group_layers(kv_group):
+            raise ValueError("Deferred sparse pointer cache has incomplete layers")
+        if not num_layers or len(cached_chunk_ptrs_npu) != num_layers:
+            raise ValueError("Deferred sparse pointer cache has incomplete layers")
+        num_chunks = len(cached_chunk_dev_ptrs[0])
+        if any(len(row) != num_chunks for row in cached_chunk_dev_ptrs):
+            raise ValueError("Deferred sparse pointer cache has ragged host rows")
+        if any(row is not None for row in cached_chunk_ptrs_npu):
+            raise ValueError("Deferred sparse pointer cache has unexpected NPU rows")
+        if not num_chunks:
+            return
+        if defer_copy:
+            table = self.stage_dense_load_tensor(
+                torch.tensor(cached_chunk_dev_ptrs, dtype=torch.long),
+                dtype=torch.long,
+            )
+        else:
+            table = torch.tensor(
+                cached_chunk_dev_ptrs, dtype=torch.long, device=self.kv_device
+            )
+        tables = getattr(self, "_layerwise_pointer_tables", None)
+        if tables is None:
+            tables = self._layerwise_pointer_tables = {}
+        tables[id(cached_chunk_ptrs_npu)] = {
+            "table": table,
+            "capacity": num_chunks,
+            "length": num_chunks,
+        }
+        cached_chunk_ptrs_npu[:] = list(table.unbind(0))
+        self._deferred_sparse_pointer_caches.pop(id(cached_chunk_ptrs_npu))
+
+    def prepare_layerwise_prefill_source_pointers(
+        self,
+        new_sources_by_layer: List[
+            Union[Sequence[Union[torch.Tensor, MemoryObj]], LayerPageSource]
+        ],
+        cached_chunk_dev_ptrs: List[List[int]],
+        cached_chunk_ptrs_npu: List[Optional[torch.Tensor]],
+        *,
+        kv_group: int = 0,
+        prefill_dma: bool = False,
+    ) -> None:
+        """Append source metadata, deferring device tables for raw prefill DMA.
+
+        The caller enables ``prefill_dma`` only for deferred P-node loads.
+        Those loads submit host addresses directly, so only their eventual
+        sparse consumer needs an NPU pointer table. Keep the mutable cache
+        identity to distinguish this state from an invalid ordinary cache.
+        """
+        if not prefill_dma:
+            self.materialize_sparse_chunk_ptr_cache(
+                cached_chunk_dev_ptrs, cached_chunk_ptrs_npu, kv_group=kv_group
+            )
+            self.append_sparse_chunk_ptr_cache_for_layers(
+                new_sources_by_layer,
+                cached_chunk_dev_ptrs,
+                cached_chunk_ptrs_npu,
+                kv_group=kv_group,
+            )
+            return
+        self.append_sparse_chunk_ptr_cache_for_layers(
+            new_sources_by_layer,
+            cached_chunk_dev_ptrs,
+            None,
+            kv_group=kv_group,
+        )
+        self.release_sparse_chunk_ptr_cache(cached_chunk_ptrs_npu)
+        cached_chunk_ptrs_npu[:] = [None] * len(cached_chunk_dev_ptrs)
+        deferred = getattr(self, "_deferred_sparse_pointer_caches", None)
+        if deferred is None:
+            deferred = self._deferred_sparse_pointer_caches = {}
+        deferred[id(cached_chunk_ptrs_npu)] = cached_chunk_ptrs_npu
+
+    def _is_deferred_sparse_pointer_cache(
+        self, cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]]
+    ) -> bool:
+        if cached_chunk_ptrs_npu is None:
+            return False
+        deferred = getattr(self, "_deferred_sparse_pointer_caches", {})
+        return deferred.get(id(cached_chunk_ptrs_npu)) is cached_chunk_ptrs_npu
 
 def _prefill_dma_plans(
     block_ids_by_bank: Sequence[Sequence[int]],
