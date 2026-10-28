@@ -7,7 +7,10 @@ file(GLOB KERNEL_FILES
   "${KVCACHE_OPS_ROOT}/kernels/single_layer/*.cpp"
   "${KVCACHE_OPS_ROOT}/kernels/multi_layer/*.cpp"
 )
-list(APPEND KERNEL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/sparse_graph_kernel.cpp")
+list(APPEND KERNEL_FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/sparse_graph_kernel.cpp"
+  "${PROJECT_SOURCE_DIR}/csrc/indexer_c8/kernel.cpp"
+)
 include("${KVCACHE_OPS_ROOT}/ascendc_with_def.cmake")
 if(DEFINED ASCEND_AICORE_ARCH)
   ascendc_library_with_def(cache_kernels SHARED ${KERNEL_FILES})
