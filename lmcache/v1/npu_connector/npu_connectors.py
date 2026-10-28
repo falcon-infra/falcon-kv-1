@@ -1278,11 +1278,6 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
             .strip().lower() == "true"
         )
-        configured_bank_count = 2
-        if self._layerwise_prefill_dma:
-            from vllm.v1.core.dsa_shared_pool import layerwise_prefill_bank_count
-
-            configured_bank_count = layerwise_prefill_bank_count()
         self.load_stream_num = 4
         self.load_stream_list = [
             torch.npu.Stream() for __ in range(self.load_stream_num)
@@ -1357,10 +1352,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         # (when there is no load for the layer that is about to use it).
         # Keep the state per KV group: latent and indexer own independent
         # physical banks even though they share the connector streams.
-        self._layerwise_prefill_bank_counts: dict[int, int] = (
-            dict.fromkeys((0, 1), configured_bank_count)
-            if self._layerwise_prefill_dma else {}
-        )
+        self._layerwise_prefill_bank_counts: dict[int, int] = {}
         self._layerwise_prefill_transfer_generations: dict[int, int] = {}
         # Raw layerwise-prefill DMA uses one FIFO stream per physical bank and
         # KV group.  Save/load operations for a bank must share this stream:
@@ -4320,7 +4312,9 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             or any(a != b for a, b in zip(starts[1:], ends[:-1], strict=True))
             or not len(slots)
         ):
-            raise ValueError("Checkpoint capture requires contiguous resident intervals")
+            raise ValueError(
+                "Checkpoint capture requires contiguous resident intervals"
+            )
         if (
             caches is None
             or len(caches) < group_layers
@@ -4341,22 +4335,55 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             kvcaches_ref=caches,
         )
         fmt = self._expected_memory_format(group)
-        tensors = []
-        for layer, objects in enumerate(memory_objs):
-            if len(objects) != len(starts) or any(obj.metadata.fmt != fmt for obj in objects):
-                raise ValueError(
-                    "Checkpoint capture requires correctly formatted pages per layer"
-                )
-            tensors.append([_layer_memory_tensor(obj, layer) for obj in objects])
-            if layout.indexer_c8 and any(
-                tensor.dtype != torch.uint8
-                or not tensor.is_contiguous()
-                or tensor.numel() < (end - start) * layout.layer_token_bytes[layer]
-                for tensor, start, end in zip(tensors[-1], starts, ends, strict=True)
-            ):
-                raise ValueError(
-                    "C8 checkpoint packet has the wrong dtype or insufficient capacity"
-                )
+        page_rows = _checkpoint_page_rows(memory_objs, starts, ends, fmt, layout)
+        if page_rows is not None:
+            buffers, rows = page_rows
+            tensors = [buffers]  # Keep every raw allocation alive through the fence.
+            samples = (
+                []
+                if layout.indexer_c8
+                else [
+                    memory_objs[0][0].layer_tensor(layer)
+                    for layer in range(group_layers)
+                ]
+            )
+        else:
+            tensors = []
+            for layer, objects in enumerate(memory_objs):
+                if len(objects) != len(starts) or any(
+                    obj.metadata.fmt != fmt for obj in objects
+                ):
+                    raise ValueError(
+                        "Checkpoint capture requires correctly formatted "
+                        "pages per layer"
+                    )
+                tensors.append([_layer_memory_tensor(obj, layer) for obj in objects])
+                if layout.indexer_c8 and any(
+                    tensor.dtype != torch.uint8
+                    or not tensor.is_contiguous()
+                    or tensor.numel() < (end - start) * layout.layer_token_bytes[layer]
+                    for tensor, start, end in zip(
+                        tensors[-1], starts, ends, strict=True
+                    )
+                ):
+                    raise ValueError(
+                        "C8 checkpoint packet has the wrong dtype "
+                        "or insufficient capacity"
+                    )
+            samples = [row[0] for row in tensors]
+            rows = [
+                [
+                    int(
+                        lmc_ops.get_device_ptr(
+                            t.data_ptr(), t.numel() * t.element_size()
+                        )
+                    )
+                    for t in row
+                ]
+                for row in tensors
+            ]
+        if any(not pointer for row in rows for pointer in row):
+            raise ValueError("Checkpoint CPU destination is not registered")
         device_slots = self._slot_mapping_on_kv_device(slots, self.store_stream)
         c8_plan = None
         if layout.indexer_c8:
@@ -4375,7 +4402,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             if c8_plan is not None
             else [
                 prepare_sparse_direct_layer_state(
-                    row[0],
+                    sample,
                     caches[layer],
                     device_slots,
                     self._layerwise_token_major(group),
@@ -4386,22 +4413,17 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                     layout.dsa_hidden_dims,
                     len(slots),
                 )
-                for layer, row in enumerate(tensors)
+                for layer, sample in enumerate(samples)
             ]
         )
-        rows = [
-            [
-                int(lmc_ops.get_device_ptr(t.data_ptr(), t.numel() * t.element_size()))
-                for t in row
-            ]
-            for row in tensors
-        ]
-        if any(not pointer for row in rows for pointer in row):
-            raise ValueError("Checkpoint CPU destination is not registered")
         offsets = torch.tensor(
             [a - base for a in starts], dtype=torch.int32, pin_memory=True
         )
-        sizes = torch.tensor([b - a for a, b in zip(starts, ends, strict=True)], dtype=torch.int32, pin_memory=True)
+        sizes = torch.tensor(
+            [b - a for a, b in zip(starts, ends, strict=True)],
+            dtype=torch.int32,
+            pin_memory=True,
+        )
         pointers = torch.tensor(rows, dtype=torch.int64, pin_memory=True)
         with self._stream_context_or_null(self.store_stream):
             offsets_npu = offsets.to(self.kv_device, non_blocking=True)
@@ -5258,11 +5280,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             )
             layerwise_prefill_bank_offset = int(
                 kwargs.get("layerwise_prefill_bank_offset", 0) or 0
-            ) % layerwise_prefill_bank_count
-        if prefill_dma and (
-            len(kwargs["prefill_dma_block_ids_by_bank"]) != layerwise_prefill_bank_count
-        ):
-            raise ValueError("Prefill DMA bank maps disagree with the rotation depth")
+            ) & 1
         if deferred_dense_direct_get:
             self._set_layerwise_prefill_bank_count(
                 kv_group,
@@ -5372,14 +5390,10 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             )
             if plan_cache is not None:
                 reused_plans = sum(
-                    plan_cache[(kv_group, bank)].reused_chunks > 0
-                    for bank in range(len(dma_plans))
+                    plan_cache[(kv_group, bank)].reused_chunks > 0 for bank in range(2)
                 )
-                plan_mode = (
-                    "full" if reused_plans == 0 else
-                    "reuse" if reused_plans == len(dma_plans) else "mix"
-                )
-                for bank in range(len(dma_plans)):
+                plan_mode = ("full", "mix", "reuse")[reused_plans]
+                for bank in range(2):
                     if plan_cache[(kv_group, bank)].mapping_changed:
                         for cache_key in tuple(bound_loads):
                             if cache_key[0] == kv_group and cache_key[2] == bank:
@@ -5647,12 +5661,6 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                         )
                     with torch.npu.stream(bank_stream):
                         deferred_load_submitted = True
-                        overlap = getattr(self, "prefill_overlap_recorder", None)
-                        overlap_dma = (
-                            overlap.start_interval(
-                                "load", bank_stream, kv_group, bank, layer_id,
-                            ) if overlap is not None else None
-                        )
                         if diagnose_bank_load:
                             native_enqueue_started = time.perf_counter()
                         if prefill_packet:
@@ -5661,8 +5669,6 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                             )
                         else:
                             lmc_ops.layerwise_prefill_dma_copy(copies, False)
-                        if overlap is not None:
-                            overlap.end_interval(overlap_dma, bank_stream)
                         if diagnose_bank_load:
                             native_enqueue_ms = (
                                 time.perf_counter() - native_enqueue_started
@@ -8751,3 +8757,64 @@ def _layer_memory_host_ptr(memory_obj: MemoryObj, layer_id: int) -> int:
         return int(data_ptr())
     tensor = _layer_memory_tensor(memory_obj, layer_id)
     return int(tensor.data_ptr())
+
+def _checkpoint_page_rows(
+    memory_objs: List[List[MemoryObj]],
+    starts: List[int],
+    ends: List[int],
+    fmt: MemoryFormat,
+    layout: Any,
+) -> Optional[tuple[list[torch.Tensor], list[list[int]]]]:
+    """Map shared physical pages once; retain generic per-layer fallback."""
+    pages = memory_objs[0]
+    layers = len(memory_objs)
+    if not (
+        all(row is pages for row in memory_objs)
+        and all(isinstance(page, LayerPageMemoryObj) for page in pages)
+    ):
+        return None
+    if len(pages) != len(starts):
+        raise ValueError("Checkpoint capture page count mismatch")
+    buffers, mapped = [], []
+    for page, start, end in zip(pages, starts, ends, strict=True):
+        raw = page.raw_data
+        if (
+            raw is None
+            or raw.device.type != "cpu"
+            or raw.dtype != torch.uint8
+            or not raw.is_contiguous()
+            or page.num_layers != layers
+        ):
+            return None
+        offsets = page.group_prefix_sum
+        if (
+            not page.is_valid()
+            or page.metadata.fmt != fmt
+            or not page.layer_layout_is_valid()
+            or len(offsets) != layers + 1
+            or offsets[0] != 0
+            or offsets[-1] > raw.numel()
+            or any(a >= b for a, b in pairwise(offsets))
+        ):
+            raise ValueError("Checkpoint capture has invalid physical page extents")
+        if layout.indexer_c8 and (
+            any(dtype != torch.uint8 for dtype in page.get_dtypes())
+            or any(
+                b - a < (end - start) * layout.layer_token_bytes[layer]
+                for layer, (a, b) in enumerate(pairwise(offsets))
+            )
+        ):
+            raise ValueError("C8 checkpoint packet has insufficient byte capacity")
+        base = int(lmc_ops.get_device_ptr(raw.data_ptr(), offsets[-1]))
+        if not base:
+            # Separately registered layer spans may still satisfy the old path.
+            return None
+        buffers.append(raw)
+        mapped.append(base)
+    return buffers, [
+        [
+            base + page.group_prefix_sum[layer]
+            for page, base in zip(pages, mapped, strict=True)
+        ]
+        for layer in range(layers)
+    ]

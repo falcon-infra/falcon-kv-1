@@ -146,8 +146,12 @@ def fixture():
     worker.capture = capture
     engine.checkpoint_worker = worker
     engine.enable_checkpoint_prefix_agreement = lambda: None
-    engine.wait_for_pending_stores = lambda ids: calls.append("drain")
     engine.wait_for_direct_stores = lambda ids: calls.append("direct-drain")
+    def drain(ids):
+        calls.append("drain")
+        engine.wait_for_direct_stores(ids)
+        return set()
+    engine.wait_for_pending_stores = drain
     engine.drop_direct_store_states = lambda ids: calls.append("drop-store")
     impl = ns["LMCacheConnectorV1Impl"]()
     impl.lmcache_engine = engine
