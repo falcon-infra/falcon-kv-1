@@ -232,6 +232,35 @@ def test_cpp_layout_enum_is_defined_without_python_injection() -> None:
         assert f'.value("{name}", GPUKVFormat::{name})' in source
 
 
+def test_mooncake_connector_borrows_native_transfer_engine() -> None:
+    requests = []
+    engine = NS(get_rpc_port=lambda: 12345, get_engine=lambda: "native-engine")
+    global_te = NS(get_transfer_engine=lambda *_args, **_kwargs: engine)
+
+    def import_module(name):
+        requests.append(name)
+        if name == "vllm.distributed.kv_transfer.ascend.utils.mooncake_transfer_engine":
+            return NS(global_te=global_te)
+        if name == "vllm.utils.network_utils":
+            return NS(get_ip=lambda: "10.0.0.1")
+        raise ModuleNotFoundError(name)
+
+    ns = functions(
+        "lmcache/v1/storage_backend/connector/mooncakestore_connector.py",
+        ["_shared_vllm_mooncake_transport"],
+        import_module=import_module,
+    )
+    assert ns["_shared_vllm_mooncake_transport"]() == (
+        global_te,
+        "10.0.0.1:12345",
+        "native-engine",
+        engine,
+    )
+    assert requests[0] == (
+        "vllm.distributed.kv_transfer.ascend.utils.mooncake_transfer_engine"
+    )
+
+
 def test_registered_buffer_copies_keep_nonblocking_semantics() -> None:
     ns = functions(
         "lmcache/v1/device_connector/memory_ops.py",

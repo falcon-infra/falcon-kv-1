@@ -118,7 +118,10 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         )
 
         self.token_database: TokenDatabase
-        self.token_database = ChunkedTokenDatabase(config, metadata)
+        if config.enable_blending:
+            self.token_database = SegmentTokenDatabase(config, metadata)
+        else:
+            self.token_database = ChunkedTokenDatabase(config, metadata)
 
         # A lock is needed since we need another thread to pull
         # responses from the lookup_and_prefetch server
@@ -426,7 +429,9 @@ class LMCacheAsyncLookupServer:
             except Exception as e:
                 logger.error("Error processing request from scheduler: %s", e)
 
-    def send_response_to_scheduler(self, lookup_id: str, num_hit_tokens: int) -> None:
+    def send_response_to_scheduler(
+        self, lookup_id: str, num_hit_tokens: int
+    ) -> None:
         """Send responses from the storage loop that owns the PUSH socket."""
         loop = self.lmcache_engine.storage_manager.loop
         try:
@@ -442,7 +447,9 @@ class LMCacheAsyncLookupServer:
             return
         self._send_response_to_scheduler(lookup_id, num_hit_tokens)
 
-    def _send_response_to_scheduler(self, lookup_id: str, num_hit_tokens: int) -> None:
+    def _send_response_to_scheduler(
+        self, lookup_id: str, num_hit_tokens: int
+    ) -> None:
         # Create structured response message
         msg = LookupResponseMsg(
             lookup_id=lookup_id,

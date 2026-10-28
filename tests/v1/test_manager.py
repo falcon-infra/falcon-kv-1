@@ -357,8 +357,8 @@ class TestLMCacheManagerShutdown:
         destroy_threads: list[int] = []
 
         with patch("lmcache.v1.manager.LMCacheEngineBuilder") as builder:
-            builder.destroy.side_effect = lambda _instance_id: destroy_threads.append(
-                threading.get_ident()
+            builder.destroy.side_effect = (
+                lambda _instance_id: destroy_threads.append(threading.get_ident())
             )
             manager.stop_services()
 

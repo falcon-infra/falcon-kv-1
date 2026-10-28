@@ -951,16 +951,8 @@ def _normalize_remote_fill_config(config: Any) -> None:
     config.extra_config = extra_config
 
 
-def _validate_config(self: Any) -> Any:
-    """Validate the paired Ascend profile and cache lifecycle settings."""
-    from lmcache.inference_profile import validate_config
-
-    validate_config(self)
-    if getattr(self, "enable_blending", False):
-        raise ValueError("CacheBlend was removed from the Ascend P4 inference profile")
+def _validate_config(self):
     """Validate configuration"""
-
-    _normalize_remote_fill_config(self)
 
     # needed for the old async serializer implementation
     # # auto-adjust save_unfull_chunk for async loading to prevent CPU fragmentation
@@ -996,7 +988,13 @@ def _validate_config(self: Any) -> Any:
             "must not run with an uninitialized Group-1 index cache."
         )
 
-    pass  # Unsupported P4 branch removed.
+    if self.enable_blending:
+        if not self.save_unfull_chunk:
+            logger.warning(
+                "Automatically setting save_unfull_chunk=True because "
+                "enable_blending=True"
+            )
+            self.save_unfull_chunk = True
 
     if (
         self.use_layerwise
@@ -1044,7 +1042,8 @@ def _validate_config(self: Any) -> Any:
         if self.max_local_cpu_size <= 0:
             raise ValueError(
                 "enable_shared_cpu_cache requires max_local_cpu_size > 0 "
-                "on rank0." + shared_cpu_config_context
+                "on rank0."
+                + shared_cpu_config_context
             )
         shared_size_gb = shared_cpu_cache_size_gb
         if shared_size_gb is not None and float(shared_size_gb) <= 0:
@@ -1057,7 +1056,8 @@ def _validate_config(self: Any) -> Any:
         if shared_name and shm_name and shared_name != shm_name:
             raise ValueError(
                 "shared_cpu_cache_name and shm_name refer to the same shared "
-                "slab and must not conflict." + shared_cpu_config_context
+                "slab and must not conflict."
+                + shared_cpu_config_context
             )
 
     if self.remote_fill_submission_mode not in _REMOTE_FILL_SUBMISSION_MODES:
@@ -1068,8 +1068,24 @@ def _validate_config(self: Any) -> Any:
         )
     remote_fill_active = bool(self.enable_remote_lmcache_store)
     if remote_fill_active:
-        # Fixed flags and role-specific settings were normalized before the
-        # shared-CPU/DSA validators, not by a plugin import or a second class.
+        # These are invariants of the only implemented RemoteFill protocol,
+        # not deployment choices: layerwise DSA two-group pages, immutable
+        # final-only publication, non-evicting reservations, and prefiller-
+        # local persistence.  Enabling the feature selects that contract.
+        self.use_layerwise = True
+        self.dsa_two_groups = True
+        self.enable_sparse_attention = True
+        self.save_unfull_chunk = True
+        extra_config = dict(extra_config)
+        extra_config.update(
+            {
+                "save_only_first_rank": True,
+                "mooncake_page_first_multi_buffer": True,
+                "mooncake_layer_merged_page_objects": True,
+                "save_chunk_meta": False,
+            }
+        )
+        self.extra_config = extra_config
         required_remote_fill = {
             "remote_url=mooncakestore://...": str(self.remote_url).startswith(
                 "mooncakestore://"
@@ -1219,15 +1235,20 @@ def _validate_config(self: Any) -> Any:
         if self.dsa_group1_load_mode == "persistent_parallel_prefetch":
             persistent_requirements.update(
                 {
-                    "enable_dsa_cold_compact_load": (self.enable_dsa_cold_compact_load),
+                    "enable_dsa_cold_compact_load": (
+                        self.enable_dsa_cold_compact_load
+                    ),
                     "enable_shared_cpu_cache": enable_shared_cpu_cache,
                 }
             )
         if self.dsa_group1_load_mode == "persistent_direct_hbm":
-            save_only_first_rank = bool(extra_config.get("save_only_first_rank", False))
+            save_only_first_rank = bool(
+                extra_config.get("save_only_first_rank", False)
+            )
             persistent_requirements.update(
                 {
-                    "pd_role=sender|receiver": self.pd_role in {"sender", "receiver"},
+                    "pd_role=sender|receiver": self.pd_role
+                    in {"sender", "receiver"},
                     "enable_remote_lmcache_store=true": bool(
                         self.enable_remote_lmcache_store
                     ),
@@ -1261,7 +1282,9 @@ def _validate_config(self: Any) -> Any:
                     }
                 )
         missing_persistent_requirements = [
-            name for name, enabled in persistent_requirements.items() if not enabled
+            name
+            for name, enabled in persistent_requirements.items()
+            if not enabled
         ]
         if missing_persistent_requirements:
             raise ValueError(

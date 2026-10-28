@@ -303,10 +303,7 @@ def test_mooncake_page_lookup_uses_pages_for_partial_tail():
         chunk_size=4,
         extra_config={"mooncake_page_first_multi_buffer": True},
     )
-    client.metadata = SimpleNamespace(
-        kv_shape=(4, 1, 4, 1, 1),
-        runtime_kv_group_layer_counts=(4, 4),
-    )
+    client.metadata = SimpleNamespace(kv_shape=(4, 1, 4, 1, 1))
     client.store = _FakeStore()
     client.token_database = token_db
 
@@ -332,9 +329,7 @@ def test_mooncake_page_lookup_expands_only_missing_legacy_page():
         chunk_size=4,
         extra_config={"mooncake_page_first_multi_buffer": True},
     )
-    client.metadata = SimpleNamespace(
-        kv_shape=(4, 1, 4, 1, 1), runtime_kv_group_layer_counts=(4, 4)
-    )
+    client.metadata = SimpleNamespace(kv_shape=(4, 1, 4, 1, 1))
     pages = [
         mooncake_page_key(
             token_db._make_key_by_hash(0x100 + chunk, kv_group=group), 4
@@ -388,9 +383,7 @@ def test_mooncake_partial_page_lookup_strips_tag_for_legacy_tail():
         chunk_size=4,
         extra_config={"mooncake_page_first_multi_buffer": True},
     )
-    client.metadata = SimpleNamespace(
-        kv_shape=(4, 1, 4, 1, 1), runtime_kv_group_layer_counts=(4, 4)
-    )
+    client.metadata = SimpleNamespace(kv_shape=(4, 1, 4, 1, 1))
     client.token_database = token_db
     full_pages = [
         mooncake_page_key(

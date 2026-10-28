@@ -95,10 +95,6 @@ class LMCacheLookupClient(LookupClientInterface):
         lookup_id: str,
         request_configs: Optional[dict] = None,
     ) -> Optional[int]:
-        if not isinstance(token_ids, list):
-            token_ids = (
-                token_ids.tolist() if hasattr(token_ids, "tolist") else list(token_ids)
-            )
         request_configs_str = ""
         if request_configs is not None and len(request_configs) != 0:
             request_configs_str = json.dumps(request_configs)
@@ -106,30 +102,39 @@ class LMCacheLookupClient(LookupClientInterface):
         # NOTE(Jiayi): We cannot only send hashes when
         # blending enabled because the blender need the
         # input embedding.
-        hashes = []
-        offsets = []
+        if not self.enable_blending:
+            hashes = []
+            offsets = []
 
-        for (
-            start,
-            end,
-            key,
-        ) in self.token_database.process_tokens(token_ids, make_key=False):
-            hashes.append(key)
-            offsets.append(end - start)
+            for (
+                start,
+                end,
+                key,
+            ) in self.token_database.process_tokens(token_ids, make_key=False):
+                hashes.append(key)
+                offsets.append(end - start)
 
-        # if the token database returns no hashes,
-        # return 0
-        if not hashes:
-            return 0
+            # if the token database returns no hashes,
+            # return 0
+            if not hashes:
+                return 0
 
-        msg_buf = [
-            hashes,
-            offsets,
-            lookup_id,
-            request_configs_str,
-        ]
-        lookup_mode = "hashes"
-        lookup_input_count = len(hashes)
+            msg_buf = [
+                hashes,
+                offsets,
+                lookup_id,
+                request_configs_str,
+            ]
+            lookup_mode = "hashes"
+            lookup_input_count = len(hashes)
+        else:
+            msg_buf = [
+                token_ids,
+                lookup_id,
+                request_configs_str,
+            ]
+            lookup_mode = "tokens"
+            lookup_input_count = len(token_ids)
 
         responses = self.transport.send_and_recv_all(msg_buf)
 
@@ -282,15 +287,24 @@ class LMCacheLookupServer:
                             lookup_input_count,
                             self.lmcache_engine.config.lookup_timeout_ms,
                         )
-                    hashes = data_frames[0]
-                    offsets = data_frames[1]
-                    lookup_result = self.lmcache_engine.lookup(
-                        hashes=hashes,
-                        offsets=offsets,
-                        lookup_id=lookup_id,
-                        pin=True,
-                        request_configs=request_configs,
-                    )
+                    if not self.enable_blending:
+                        hashes = data_frames[0]
+                        offsets = data_frames[1]
+                        lookup_result = self.lmcache_engine.lookup(
+                            hashes=hashes,
+                            offsets=offsets,
+                            lookup_id=lookup_id,
+                            pin=True,
+                            request_configs=request_configs,
+                        )
+                    else:
+                        tokens = data_frames[0]
+                        lookup_result = self.lmcache_engine.lookup(
+                            tokens=tokens,
+                            lookup_id=lookup_id,
+                            pin=True,
+                            request_configs=request_configs,
+                        )
                     if perf_enabled:
                         lookup_elapsed_ms = (
                             time.perf_counter() - lookup_started

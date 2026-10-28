@@ -467,12 +467,16 @@ class StorageManager:
             for backend in selected
         )
 
-    def supports_batched_put_layer_pages(self, location: Optional[str] = None) -> bool:
+    def supports_batched_put_layer_pages(
+        self, location: Optional[str] = None
+    ) -> bool:
         """Whether selected backends accept one physical page for all layers."""
         return self._supports_layer_page_backends(
             [
                 backend
-                for _, backend in self.get_active_storage_backends(location=location)
+                for _, backend in self.get_active_storage_backends(
+                    location=location
+                )
             ]
         )
 
@@ -493,7 +497,9 @@ class StorageManager:
         if not pages:
             return []
         selected = list(self.get_active_storage_backends(location=location))
-        if not self._supports_layer_page_backends([backend for _, backend in selected]):
+        if not self._supports_layer_page_backends(
+            [backend for _, backend in selected]
+        ):
             raise RuntimeError("Selected storage backends do not support layer pages")
 
         layer_count = pages[0].num_layers
@@ -515,7 +521,11 @@ class StorageManager:
             and bool(getattr(backend, "use_hot", False))
         )
         remote = next(
-            (backend for _, backend in selected if isinstance(backend, RemoteBackend)),
+            (
+                backend
+                for _, backend in selected
+                if isinstance(backend, RemoteBackend)
+            ),
             None,
         )
         required_futures: list[Future] = []
@@ -1826,7 +1836,7 @@ class StorageManager:
                 self.config,
                 self.metadata,
                 self.loop,
-                dst_device=("npu" if is_npu_worker(self.metadata) else "cpu"),
+                dst_device=("cuda" if is_npu_worker(self.metadata) else "cpu"),
                 lmcache_worker=self.lmcache_worker,
                 skip_backends=existing_names,
                 existing_backends=self.storage_backends,

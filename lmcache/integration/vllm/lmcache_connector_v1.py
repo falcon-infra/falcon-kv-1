@@ -111,7 +111,9 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         that upgrading LMCache without a hybrid-capable transport cannot make
         an older consumer reject the otherwise valid group-1 descriptor.
         """
-        configure = getattr(self._lmcache_engine, "configure_live_latent_source", None)
+        configure = getattr(
+            self._lmcache_engine, "configure_live_latent_source", None
+        )
         if callable(configure):
             configure(enabled)
 
@@ -129,7 +131,9 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         self, handled_groups: tuple[int, ...]
     ) -> dict[str, dict[str, Any]]:
         """Internal worker hook consumed by AscendMultiConnector."""
-        return self._lmcache_engine.take_live_split_destination_plans(handled_groups)
+        return self._lmcache_engine.take_live_split_destination_plans(
+            handled_groups
+        )
 
     def _accept_live_split_results(self, results: dict[str, str]) -> None:
         """Internal worker hook for negotiated live-transfer acknowledgements."""
@@ -324,7 +328,9 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
     def update_connector_worker_metadata(
         self, worker_metadata: Any, active_req_ids: set[str]
     ) -> None:
-        update = getattr(self._lmcache_engine, "update_connector_worker_metadata", None)
+        update = getattr(
+            self._lmcache_engine, "update_connector_worker_metadata", None
+        )
         if callable(update):
             update(worker_metadata, active_req_ids)
 

@@ -163,7 +163,8 @@ class TokenDatabase(metaclass=abc.ABCMeta):
                 raise TypeError("token hash function returned an empty byte digest")
             return bytes, len(probe)
         raise TypeError(
-            f"token hash function must return int or bytes, got {type(probe).__name__}"
+            "token hash function must return int or bytes, got "
+            f"{type(probe).__name__}"
         )
 
     def _get_vllm_hash_func(self, hash_algorithm: str):
@@ -278,9 +279,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         raise NotImplementedError
 
     def _make_key_by_hash(
-        self,
-        chunk_hash: int,
-        request_configs: Optional[dict] = None,
+        self, chunk_hash: int, request_configs: Optional[dict] = None,
         kv_group: int = 0,
         valid_tokens: Optional[int] = None,
     ):
@@ -298,7 +297,9 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             )
         if self.mooncake_payload_layout is not None:
             request_configs = dict(request_configs or {})
-            request_configs[MOONCAKE_PAYLOAD_LAYOUT_TAG] = self.mooncake_payload_layout
+            request_configs[MOONCAKE_PAYLOAD_LAYOUT_TAG] = (
+                self.mooncake_payload_layout
+            )
             chunk_size = int(getattr(config, "chunk_size", 0))
             if valid_tokens is not None and valid_tokens != chunk_size:
                 if not 0 < valid_tokens < chunk_size:

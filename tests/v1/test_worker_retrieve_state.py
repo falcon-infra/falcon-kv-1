@@ -167,11 +167,7 @@ def test_cold_submit_and_publish_preserve_async_handoff(
         token_ids=[1, 2, 3, 4, 5],
         sparse_warm_ref=False,
         indexer_slot_mapping=[adapter_mod._build_slot_mapping([7, 2], 4, 5)],
-        load_spec=SimpleNamespace(
-            dsa_cold_load_generation=1,
-            lmcache_cached_tokens=5,
-            dsa_group1_direct_hbm=False,
-        ),
+        load_spec=SimpleNamespace(dsa_cold_load_generation=1, lmcache_cached_tokens=5),
     )
     impl._submit_dsa_cold_compact_load(request)
     assert impl._get_cold_load_coordinator().futures["request"][3] == {7, 2}
@@ -259,9 +255,7 @@ def test_capture_barrier_waits_for_indexer_after_latent_failure() -> None:
 
 
 @pytest.mark.parametrize("indexer_layers", [1, 2])
-def test_cold_compact_indexer_uses_dense_retrieve_path(
-    monkeypatch, indexer_layers
-) -> None:
+def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
     monkeypatch.setenv("PD_SERVING_PERF", "1")
     monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
     impl = _make_impl()
@@ -277,7 +271,7 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(
     monkeypatch.setattr(adapter_mod.torch, "npu", npu, raising=False)
 
     def dense_retrieve(_tokens, _mask, **kwargs):
-        kwargs["cached_memory_objs"][:] = [[owner] for _ in range(indexer_layers)]
+        kwargs["cached_memory_objs"][:] = [[owner], [owner]]
         kwargs["_dense_load_readiness_out"].append(readiness)
         assert kwargs["_retain_shared_dense_cache"] is True
         assert kwargs["shared_cpu_phase"] == "dsa_cold_compact_indexer"
@@ -285,13 +279,16 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(
         assert "shared_cpu_request_preflight_state" not in kwargs
         assert "direct_external_pages" not in kwargs
         assert "_cold_perf_breakdown" not in kwargs
-        for _ in range(indexer_layers + 1):
-            yield None
+        yield None
+        yield None
+        yield None
         yield torch.ones(4, dtype=torch.bool)
 
     record = MagicMock(return_value=readiness)
     synchronize = MagicMock()
-    stage = MagicMock(side_effect=lambda tensor, **_kwargs: tensor.to(dtype=torch.long))
+    stage = MagicMock(
+        side_effect=lambda tensor, **_kwargs: tensor.to(dtype=torch.long)
+    )
     impl._sparse_retrieve_kwargs = MagicMock(
         side_effect=AssertionError("dense load built sparse retrieve metadata")
     )
@@ -311,7 +308,8 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(
         req_id="request",
         request_configs=None,
         load_spec=SimpleNamespace(
-            vllm_cached_tokens=0, lmcache_cached_tokens=4, dsa_group1_direct_hbm=False
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=4,
         ),
     )
     plan = {
@@ -320,7 +318,7 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(
         "token_mask": torch.ones(4, dtype=torch.bool),
         "token_count": 4,
         "indexer_slots_cpu": torch.arange(4),
-        "indexer_kvcaches": [object() for _ in range(indexer_layers)],
+        "indexer_kvcaches": [object(), object()],
         "planned_at": adapter_mod.serving_perf_now(),
         "latent_shared_ready": Future(),
     }
@@ -370,7 +368,7 @@ def test_cold_compact_shared_indexer_waits_for_latent_publication() -> None:
     request = SimpleNamespace(
         req_id="request",
         request_configs=None,
-        load_spec=SimpleNamespace(vllm_cached_tokens=0, dsa_group1_direct_hbm=False),
+        load_spec=SimpleNamespace(vllm_cached_tokens=0),
     )
     gate = Future()
     plan = {
@@ -396,7 +394,9 @@ def test_cold_compact_shared_indexer_waits_for_latent_publication() -> None:
 
 def test_cold_compact_prefetches_before_dense_retrieve() -> None:
     impl = _make_impl()
-    impl.config = SimpleNamespace(dsa_group1_load_mode="persistent_parallel_prefetch")
+    impl.config = SimpleNamespace(
+        dsa_group1_load_mode="persistent_parallel_prefetch"
+    )
     impl.num_layers = 1
     impl.device = "cpu"
     readiness = object()
@@ -456,9 +456,7 @@ def test_cold_compact_prefetches_before_dense_retrieve() -> None:
         "request": SimpleNamespace(
             req_id="request",
             request_configs=None,
-            load_spec=SimpleNamespace(
-                vllm_cached_tokens=0, dsa_group1_direct_hbm=False
-            ),
+            load_spec=SimpleNamespace(vllm_cached_tokens=0),
         ),
         "tokens": [1, 2, 3, 4],
         "token_mask": torch.ones(4, dtype=torch.bool),
@@ -485,7 +483,9 @@ def test_cold_compact_prefetches_before_dense_retrieve() -> None:
 
 def test_cold_compact_prefetch_owner_released_when_latent_load_fails() -> None:
     impl = _make_impl()
-    impl.config = SimpleNamespace(dsa_group1_load_mode="persistent_parallel_prefetch")
+    impl.config = SimpleNamespace(
+        dsa_group1_load_mode="persistent_parallel_prefetch"
+    )
     impl.num_layers = 1
     impl.device = "cpu"
     owner = SimpleNamespace(
@@ -508,11 +508,7 @@ def test_cold_compact_prefetch_owner_released_when_latent_load_fails() -> None:
         retrieve_layer=retrieve,
     )
     plan = {
-        "request": SimpleNamespace(
-            req_id="request",
-            request_configs=None,
-            load_spec=SimpleNamespace(dsa_group1_direct_hbm=False),
-        ),
+        "request": SimpleNamespace(req_id="request", request_configs=None),
         "tokens": [1],
         "token_mask": torch.ones(1, dtype=torch.bool),
         "token_count": 1,
@@ -532,7 +528,9 @@ def test_cold_compact_prefetch_owner_released_when_latent_load_fails() -> None:
 
 def test_cold_compact_prefetch_failure_releases_and_uses_dense_path() -> None:
     impl = _make_impl()
-    impl.config = SimpleNamespace(dsa_group1_load_mode="persistent_parallel_prefetch")
+    impl.config = SimpleNamespace(
+        dsa_group1_load_mode="persistent_parallel_prefetch"
+    )
     impl.num_layers = 1
     impl.device = "cpu"
     prefetch_owner = SimpleNamespace(
@@ -568,11 +566,7 @@ def test_cold_compact_prefetch_failure_releases_and_uses_dense_path() -> None:
     gate = Future()
     gate.set_result(None)
     plan = {
-        "request": SimpleNamespace(
-            req_id="request",
-            request_configs=None,
-            load_spec=SimpleNamespace(dsa_group1_direct_hbm=False),
-        ),
+        "request": SimpleNamespace(req_id="request", request_configs=None),
         "tokens": [1],
         "token_mask": torch.ones(1, dtype=torch.bool),
         "token_count": 1,
@@ -592,8 +586,7 @@ def test_cold_compact_prefetch_failure_releases_and_uses_dense_path() -> None:
 
 @pytest.mark.parametrize("perf_enabled", [False, True])
 def test_cold_compact_direct_group1_bypasses_gate_and_layer_generator(
-    perf_enabled: bool,
-    monkeypatch: pytest.MonkeyPatch,
+    perf_enabled: bool, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     impl = _make_impl()
     clock = MagicMock(
@@ -617,8 +610,7 @@ def test_cold_compact_direct_group1_bypasses_gate_and_layer_generator(
     gate = Future()
     token_mask = torch.ones(4, dtype=torch.bool)
     request = SimpleNamespace(
-        req_id="request",
-        request_configs={"x": 1},
+        req_id="request", request_configs={"x": 1},
         load_spec=SimpleNamespace(dsa_group1_direct_hbm=True),
     )
     plan = {
@@ -669,7 +661,9 @@ def test_cold_compact_dense_failure_releases_prefetch_owner_only() -> None:
             self.releases += 1
 
     impl = _make_impl()
-    impl.config = SimpleNamespace(dsa_group1_load_mode="persistent_parallel_prefetch")
+    impl.config = SimpleNamespace(
+        dsa_group1_load_mode="persistent_parallel_prefetch"
+    )
     impl.num_layers = 1
     impl.device = "cpu"
     prefetch_owner = Owner("prefetch")
@@ -698,11 +692,7 @@ def test_cold_compact_dense_failure_releases_prefetch_owner_only() -> None:
     gate = Future()
     gate.set_result(None)
     plan = {
-        "request": SimpleNamespace(
-            req_id="request",
-            request_configs=None,
-            load_spec=SimpleNamespace(dsa_group1_direct_hbm=False),
-        ),
+        "request": SimpleNamespace(req_id="request", request_configs=None),
         "tokens": [1],
         "token_mask": torch.ones(1, dtype=torch.bool),
         "token_count": 1,
@@ -731,11 +721,7 @@ def test_cold_compact_dense_path_requires_source_retention_support() -> None:
         retrieve_layer=retrieve,
     )
     plan = {
-        "request": SimpleNamespace(
-            req_id="request",
-            request_configs=None,
-            load_spec=SimpleNamespace(dsa_group1_direct_hbm=False),
-        ),
+        "request": SimpleNamespace(req_id="request", request_configs=None),
         "tokens": [1],
         "token_mask": torch.ones(1, dtype=torch.bool),
         "token_count": 1,
@@ -808,9 +794,7 @@ def test_failed_cold_indexer_does_not_double_release_adopted_source(
         "request": SimpleNamespace(
             req_id="request",
             request_configs=None,
-            load_spec=SimpleNamespace(
-                vllm_cached_tokens=0, dsa_group1_direct_hbm=False
-            ),
+            load_spec=SimpleNamespace(vllm_cached_tokens=0),
         ),
         "tokens": [1, 2, 3, 4],
         "token_mask": torch.ones(4, dtype=torch.bool),
@@ -2125,9 +2109,7 @@ class TestWorkerRetrieveState:
         impl._release_shared_worker_retrieve_state = MagicMock()
         request = SimpleNamespace(
             req_id="req-1",
-            load_spec=SimpleNamespace(
-                lmcache_cached_tokens=1, dsa_group1_direct_hbm=False
-            ),
+            load_spec=SimpleNamespace(lmcache_cached_tokens=1),
         )
         plan = {
             "request": request,
@@ -2214,9 +2196,7 @@ class TestWorkerRetrieveState:
         )
         request = SimpleNamespace(
             req_id="req-1",
-            load_spec=SimpleNamespace(
-                lmcache_cached_tokens=1, dsa_group1_direct_hbm=False
-            ),
+            load_spec=SimpleNamespace(lmcache_cached_tokens=1),
         )
         plan = {
             "request": request,
@@ -2289,7 +2269,7 @@ class TestWorkerRetrieveState:
         readiness = object()
         connector = SimpleNamespace(
             query_dense_load_readiness=MagicMock(return_value=True),
-            synchronize_dense_load_readiness=MagicMock(),
+            synchronize_dense_load_readiness=MagicMock()
         )
         engine = SimpleNamespace(
             gpu_connector=connector,
@@ -2305,7 +2285,9 @@ class TestWorkerRetrieveState:
         state._dsa_cold_prune_protected = True
         impl._worker_retrieve_state = {"compact": state}
 
-        assert impl._finalize_worker_requests_after_store({"compact"}) == {"compact"}
+        assert impl._finalize_worker_requests_after_store({"compact"}) == {
+            "compact"
+        }
 
         connector.synchronize_dense_load_readiness.assert_not_called()
         assert impl._worker_retrieve_state == {}
@@ -2334,7 +2316,9 @@ class TestWorkerRetrieveState:
             )
         )
 
-        assert impl._finalize_worker_requests_after_store({"compact"}) == {"compact"}
+        assert impl._finalize_worker_requests_after_store({"compact"}) == {
+            "compact"
+        }
 
         connector = impl.lmcache_engine.gpu_connector
         connector.synchronize_dense_load_readiness.assert_not_called()
@@ -3464,7 +3448,9 @@ class TestWorkerRetrieveState:
 
         assert impl.current_layer == 1
 
-    def test_retrieve_stats_combine_mtp_rows_and_reset_each_window(self, monkeypatch):
+    def test_retrieve_stats_combine_mtp_rows_and_reset_each_window(
+        self, monkeypatch
+    ):
         monkeypatch.setenv(
             adapter_mod.RETRIEVE_STATS_INTERVAL_SECONDS_ENV,
             "10",
@@ -4102,7 +4088,9 @@ class TestWorkerRetrieveState:
         )
         impl, _, _ = make_worker_connector([req], use_layerwise=True)
         impl.config.dsa_two_groups = True
-        impl._indexer_layer_names = ["model.layers.0.self_attn.indexer.k_cache"]
+        impl._indexer_layer_names = [
+            "model.layers.0.self_attn.indexer.k_cache"
+        ]
         impl._layerwise_requests = [req]
         impl._layerwise_retriever_is_sparse = [False]
 
@@ -4114,7 +4102,9 @@ class TestWorkerRetrieveState:
         impl._abort_layerwise_retrieve_step = MagicMock()
 
         with pytest.raises(RuntimeError, match="without a Group-1 retriever"):
-            impl.wait_for_layer_load("model.layers.0.self_attn.indexer.k_cache")
+            impl.wait_for_layer_load(
+                "model.layers.0.self_attn.indexer.k_cache"
+            )
 
         impl._abort_layerwise_retrieve_step.assert_called_once_with([req])
 
@@ -4831,7 +4821,9 @@ class TestWorkerRetrieveState:
     def test_cold_compact_resume_requires_prepared_group0_source(self) -> None:
         request = make_sparse_req_meta("cold-resume", token_count=4)
         request.load_spec.dsa_cold_compact_resume = True
-        impl, _, engine = make_worker_connector([request], use_layerwise=True)
+        impl, _, engine = make_worker_connector(
+            [request], use_layerwise=True
+        )
         impl.config.dsa_two_groups = False
         impl.num_layers = 1
         impl._refresh_kvcaches_list()
@@ -4849,7 +4841,9 @@ class TestWorkerRetrieveState:
             RuntimeError,
             match="Cold compact resume lost its prepared Group-0 source",
         ):
-            impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+            impl.start_load_kv(
+                SimpleNamespace(attn_metadata=SimpleNamespace())
+            )
 
     def test_sparse_warm_ref_reuses_worker_metadata(self):
         req = make_sparse_req_meta("req-1", token_count=256)
@@ -5103,12 +5097,16 @@ class TestWorkerRetrieveState:
             RuntimeError,
             match="Cold compact resume requires a prepared worker load",
         ):
-            impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+            impl.start_load_kv(
+                SimpleNamespace(attn_metadata=SimpleNamespace())
+            )
 
     def test_dense_two_group_load_rejects_missing_indexer_mapping(self):
         dense = make_sparse_req_meta("dense", token_count=4)
         dense.is_sparse_decode = False
-        impl, _, engine = make_worker_connector([dense], use_layerwise=True)
+        impl, _, engine = make_worker_connector(
+            [dense], use_layerwise=True
+        )
         impl.config.dsa_two_groups = True
         impl.num_layers = 1
         impl.kv_caches = {
@@ -5142,7 +5140,9 @@ class TestWorkerRetrieveState:
             RuntimeError,
             match="could not resolve the Group-1 index slot mapping",
         ):
-            impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+            impl.start_load_kv(
+                SimpleNamespace(attn_metadata=SimpleNamespace())
+            )
 
         assert closed == ["latent"]
         assert engine.unpinned == ["dense"]
@@ -5175,11 +5175,15 @@ class TestWorkerRetrieveState:
         }
 
         assert torch.equal(
-            impl._indexer_slot_mapping_from_attn_metadata(metadata, layer_name),
+            impl._indexer_slot_mapping_from_attn_metadata(
+                metadata, layer_name
+            ),
             indexer_slots,
         )
         assert torch.equal(
-            impl._indexer_retrieve_slot_mapping(metadata, 4, layer_name),
+            impl._indexer_retrieve_slot_mapping(
+                metadata, 4, layer_name
+            ),
             indexer_slots,
         )
         request = SimpleNamespace(indexer_slot_mapping=[indexer_slots])
@@ -5309,10 +5313,14 @@ class TestWorkerRetrieveState:
                 closed.append("latent")
 
         engine.enable_shared_cpu_cache = False
-        engine.retrieve_layer_head_token_wise = lambda *_args, **_kwargs: _retriever()
+        engine.retrieve_layer_head_token_wise = (
+            lambda *_args, **_kwargs: _retriever()
+        )
 
         with pytest.raises(RuntimeError, match="full Group-1 index slot"):
-            impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+            impl.start_load_kv(
+                SimpleNamespace(attn_metadata=SimpleNamespace())
+            )
 
         assert closed == ["latent"]
         assert engine.unpinned == ["req-1"]
@@ -6939,7 +6947,9 @@ class TestWorkerRetrieveState:
         impl.lmcache_engine.admit_live_split_pages.assert_not_called()
 
     @pytest.mark.parametrize("status", ["failure", "fallback", "timeout"])
-    def test_live_split_failure_releases_and_uses_persistent_indexer(self, status):
+    def test_live_split_failure_releases_and_uses_persistent_indexer(
+        self, status
+    ):
         impl = _make_impl()
         context = {"handled_groups": (1,), "pages": []}
         entry = {
@@ -6948,12 +6958,16 @@ class TestWorkerRetrieveState:
             "latent_gate": Future(),
         }
         impl._dsa_live_split_pending = {"req-live": entry}
-        impl.lmcache_engine = SimpleNamespace(_release_live_split_import=MagicMock())
+        impl.lmcache_engine = SimpleNamespace(
+            _release_live_split_import=MagicMock()
+        )
         impl._fallback_live_split_indexer = MagicMock()
 
         impl.accept_live_split_results({"req-live": status})
 
-        impl.lmcache_engine._release_live_split_import.assert_called_once_with(context)
+        impl.lmcache_engine._release_live_split_import.assert_called_once_with(
+            context
+        )
         impl._fallback_live_split_indexer.assert_called_once_with(entry)
         assert entry["latent_gate"].done()
 
@@ -6967,7 +6981,9 @@ class TestWorkerRetrieveState:
         }
         release = MagicMock(side_effect=[RuntimeError("retry"), None])
         impl._dsa_live_split_pending = {"req-live": entry}
-        impl.lmcache_engine = SimpleNamespace(_release_live_split_import=release)
+        impl.lmcache_engine = SimpleNamespace(
+            _release_live_split_import=release
+        )
         impl._fallback_live_split_indexer = MagicMock()
 
         with pytest.raises(RuntimeError, match="retry"):
@@ -6989,9 +7005,13 @@ class TestWorkerRetrieveState:
             "indexer_completion": Future(),
             "latent_gate": Future(),
         }
-        impl.lmcache_engine = SimpleNamespace(_release_live_split_import=MagicMock())
+        impl.lmcache_engine = SimpleNamespace(
+            _release_live_split_import=MagicMock()
+        )
 
-        impl._cancel_live_split_entry(entry, "cancelled", release_context=False)
+        impl._cancel_live_split_entry(
+            entry, "cancelled", release_context=False
+        )
 
         assert not entry["latent_gate"].done()
         assert not entry["indexer_completion"].done()
@@ -7000,7 +7020,9 @@ class TestWorkerRetrieveState:
         impl._dsa_live_split_pending = {"req-live": entry}
         impl.accept_live_split_results({"req-live": "failure"})
 
-        impl.lmcache_engine._release_live_split_import.assert_called_once_with(context)
+        impl.lmcache_engine._release_live_split_import.assert_called_once_with(
+            context
+        )
         assert entry["latent_gate"].result() is None
         with pytest.raises(RuntimeError, match="cancelled"):
             entry["indexer_completion"].result()
@@ -7049,7 +7071,9 @@ class TestWorkerRetrieveState:
             "destination_owners": (object(),),
         }
         prepare = MagicMock(return_value=(destination, context))
-        impl.lmcache_engine = SimpleNamespace(_prepare_live_split_import=prepare)
+        impl.lmcache_engine = SimpleNamespace(
+            _prepare_live_split_import=prepare
+        )
         impl._dsa_live_split_pending = {
             "req-live": {
                 "request": request,
@@ -7076,14 +7100,18 @@ class TestWorkerRetrieveState:
         assert kwargs["dp_rank"] == 1
         assert impl._dsa_live_split_pending["req-live"]["context"] is context
         assert context["pages"] == []
-        assert impl._dsa_live_split_pending["req-live"]["latent_gate"].done()
+        assert impl._dsa_live_split_pending["req-live"][
+            "latent_gate"
+        ].done()
 
     def test_live_split_starts_persistent_group0_before_destination_plan(self):
         impl = _make_impl()
         impl._block_size = 16
         impl.device = "cpu"
         impl._kvcaches_for_group = MagicMock(return_value=[])
-        impl.lmcache_engine = SimpleNamespace(_prepare_live_split_import=MagicMock())
+        impl.lmcache_engine = SimpleNamespace(
+            _prepare_live_split_import=MagicMock()
+        )
         latent_task = Future()
         executor = SimpleNamespace(submit=MagicMock(return_value=latent_task))
         impl._get_dsa_cold_load_executor = MagicMock(return_value=executor)
@@ -7096,7 +7124,6 @@ class TestWorkerRetrieveState:
             load_spec=SimpleNamespace(
                 dsa_cold_load_generation=1,
                 lmcache_cached_tokens=2,
-                dsa_group1_direct_hbm=False,
             ),
             token_ids=[1, 2],
             indexer_slot_mapping=[torch.arange(2)],
@@ -7114,7 +7141,9 @@ class TestWorkerRetrieveState:
         impl._block_size = 16
         impl.device = "cpu"
         impl._kvcaches_for_group = MagicMock(return_value=[])
-        impl.lmcache_engine = SimpleNamespace(_prepare_live_split_import=MagicMock())
+        impl.lmcache_engine = SimpleNamespace(
+            _prepare_live_split_import=MagicMock()
+        )
         executor = SimpleNamespace(submit=MagicMock())
         impl._get_dsa_cold_load_executor = MagicMock(return_value=executor)
         request = SimpleNamespace(
@@ -7126,7 +7155,6 @@ class TestWorkerRetrieveState:
             load_spec=SimpleNamespace(
                 dsa_cold_load_generation=1,
                 lmcache_cached_tokens=2,
-                dsa_group1_direct_hbm=False,
             ),
             token_ids=[1, 2],
             indexer_slot_mapping=[torch.arange(2)],
@@ -7147,7 +7175,9 @@ class TestWorkerRetrieveState:
         impl = _make_impl()
         impl._dsa_live_split_pending = {}
         impl._get_cold_load_coordinator().futures = {}
-        impl.lmcache_engine = SimpleNamespace(_prepare_live_split_import=MagicMock())
+        impl.lmcache_engine = SimpleNamespace(
+            _prepare_live_split_import=MagicMock()
+        )
         request = SimpleNamespace(
             req_id="req-live",
             live_split_requested=True,
@@ -7169,10 +7199,14 @@ class TestWorkerRetrieveState:
         context = {"pages": [], "destination_owners": ()}
         destination = {"segments": [], "group_byte_totals": (8, 4)}
         impl.lmcache_engine = SimpleNamespace(
-            _prepare_live_split_import=MagicMock(return_value=(destination, context)),
+            _prepare_live_split_import=MagicMock(
+                return_value=(destination, context)
+            ),
             admit_live_split_pages=MagicMock(),
             _release_live_split_import=MagicMock(),
-            gpu_connector=SimpleNamespace(record_dense_load_readiness=lambda: object()),
+            gpu_connector=SimpleNamespace(
+                record_dense_load_readiness=lambda: object()
+            ),
         )
         impl._dsa_live_split_pending = {
             "req-live": {
@@ -7209,7 +7243,9 @@ class TestWorkerRetrieveState:
 
         impl.accept_live_split_results({"req-live": "success"})
 
-        impl.lmcache_engine.admit_live_split_pages.assert_called_once_with(context)
+        impl.lmcache_engine.admit_live_split_pages.assert_called_once_with(
+            context
+        )
         assert gate.done()
 
     def test_live_split_indexer_success_still_loads_persistent_group0(
@@ -7230,15 +7266,15 @@ class TestWorkerRetrieveState:
                 yield torch.ones(2, dtype=torch.bool)
 
         retrieve = MagicMock(side_effect=lambda *args, **kwargs: latent_retriever())
-        impl.lmcache_engine = SimpleNamespace(retrieve_layer_head_token_wise=retrieve)
+        impl.lmcache_engine = SimpleNamespace(
+            retrieve_layer_head_token_wise=retrieve
+        )
         impl._sparse_retrieve_kwargs = MagicMock(
             return_value=({"cached_retrieve_location": "RemoteBackend"}, None, None)
         )
         request = SimpleNamespace(
             req_id="req-live",
-            load_spec=SimpleNamespace(
-                lmcache_cached_tokens=2, dsa_group1_direct_hbm=False
-            ),
+            load_spec=SimpleNamespace(lmcache_cached_tokens=2),
         )
         plan = {
             "request": request,
@@ -7289,15 +7325,15 @@ class TestWorkerRetrieveState:
                 yield torch.ones(2, dtype=torch.bool)
 
         retrieve = MagicMock(side_effect=lambda *args, **kwargs: latent_retriever())
-        impl.lmcache_engine = SimpleNamespace(retrieve_layer_head_token_wise=retrieve)
+        impl.lmcache_engine = SimpleNamespace(
+            retrieve_layer_head_token_wise=retrieve
+        )
         impl._sparse_retrieve_kwargs = MagicMock(
             return_value=({"cached_retrieve_location": "RemoteBackend"}, None, None)
         )
         request = SimpleNamespace(
             req_id="req-live",
-            load_spec=SimpleNamespace(
-                lmcache_cached_tokens=2, dsa_group1_direct_hbm=False
-            ),
+            load_spec=SimpleNamespace(lmcache_cached_tokens=2),
         )
         plan = {
             "request": request,
@@ -7341,7 +7377,6 @@ class TestWorkerRetrieveState:
             lmcache_cached_tokens=32,
             dsa_committed_end=32,
             dsa_remap_frontier=31,
-            dsa_group1_direct_hbm=False,
         )
         request = SimpleNamespace(load_spec=load_spec)
         impl._get_cold_load_coordinator().futures = {
@@ -7427,11 +7462,15 @@ class TestWorkerRetrieveState:
             "latent_gate": Future(),
             "indexer_completion": Future(),
         }
-        impl.lmcache_engine = SimpleNamespace(_release_live_split_import=MagicMock())
+        impl.lmcache_engine = SimpleNamespace(
+            _release_live_split_import=MagicMock()
+        )
 
         impl._cancel_live_split_entry(entry, "cancelled")
 
-        impl.lmcache_engine._release_live_split_import.assert_called_once_with(context)
+        impl.lmcache_engine._release_live_split_import.assert_called_once_with(
+            context
+        )
         assert entry["context"] is None
         with pytest.raises(RuntimeError, match="cancelled"):
             entry["latent_gate"].result()
@@ -7448,10 +7487,14 @@ class TestWorkerRetrieveState:
             "indexer_completion": Future(),
         }
         release = MagicMock()
-        impl.lmcache_engine = SimpleNamespace(_release_live_split_import=release)
+        impl.lmcache_engine = SimpleNamespace(
+            _release_live_split_import=release
+        )
         impl._fallback_live_split_indexer = MagicMock()
 
-        impl._cancel_live_split_entry(entry, "cancelled", release_context=False)
+        impl._cancel_live_split_entry(
+            entry, "cancelled", release_context=False
+        )
         assert entry["context"] is context
         assert not entry["indexer_completion"].done()
         release.assert_not_called()
@@ -7466,7 +7509,9 @@ class TestWorkerRetrieveState:
         assert impl._dsa_live_split_pending == {}
 
     @pytest.mark.parametrize("live_requested", [True, False])
-    def test_live_split_reused_id_preserves_active_generation(self, live_requested):
+    def test_live_split_reused_id_preserves_active_generation(
+        self, live_requested
+    ):
         impl = _make_impl()
         old_context = {"pages": [object()]}
         old_dependency = Future()
@@ -7478,7 +7523,9 @@ class TestWorkerRetrieveState:
         impl._dsa_live_split_pending = {"req-live": old_pending}
         impl._get_cold_load_coordinator().futures = {"req-live": old_future}
         impl._get_dsa_cold_load_executor = MagicMock()
-        impl.lmcache_engine = SimpleNamespace(_prepare_live_split_import=MagicMock())
+        impl.lmcache_engine = SimpleNamespace(
+            _prepare_live_split_import=MagicMock()
+        )
         request = SimpleNamespace(
             req_id="req-live",
             live_split_requested=live_requested,
@@ -7492,10 +7539,9 @@ class TestWorkerRetrieveState:
         assert impl._dsa_live_split_pending == {"req-live": old_pending}
         assert impl._dsa_live_split_pending["req-live"] is old_pending
         assert impl._dsa_live_split_pending["req-live"]["context"] is old_context
-        assert (
-            impl._dsa_live_split_pending["req-live"]["indexer_completion"]
-            is old_dependency
-        )
+        assert impl._dsa_live_split_pending["req-live"][
+            "indexer_completion"
+        ] is old_dependency
         assert impl._get_cold_load_coordinator().futures["req-live"] is old_future
         impl._get_dsa_cold_load_executor.assert_not_called()
         impl.lmcache_engine._prepare_live_split_import.assert_not_called()

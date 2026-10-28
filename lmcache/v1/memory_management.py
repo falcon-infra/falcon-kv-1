@@ -790,7 +790,9 @@ class TensorMemoryObj(MemoryObj):
                 return len(self.meta.cached_positions)
             token_dim = self.meta.fmt.token_dim()
             if token_dim >= len(self.meta.shape):
-                raise ValueError("Flat memory object requires valid_tokens metadata")
+                raise ValueError(
+                    "Flat memory object requires valid_tokens metadata"
+                )
             return self.meta.shape[token_dim]
 
     def pin(self) -> bool:
@@ -1785,7 +1787,9 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             if token_dim >= len(shapes[0]) and len(shapes[0]) == 1:
                 raise ValueError("Flat layer-page shape requires full_tokens")
             full_tokens = int(
-                shapes[0][token_dim] if token_dim < len(shapes[0]) else shapes[0][0]
+                shapes[0][token_dim]
+                if token_dim < len(shapes[0])
+                else shapes[0][0]
             )
         full_shape = _layer_page_shape(
             shapes[0], fmt, full_tokens, full_tokens=full_tokens
@@ -1805,7 +1809,9 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             positions_by_count: dict[int, list[int]] = {}
             for index, count in enumerate(token_counts):
                 positions_by_count.setdefault(count, []).append(index)
-            pages_by_position: list[Optional[LayerPageMemoryObj]] = [None] * batch_size
+            pages_by_position: list[Optional[LayerPageMemoryObj]] = [
+                None
+            ] * batch_size
             allocated_pages: list[LayerPageMemoryObj] = []
             for count, positions in positions_by_count.items():
                 allocated = self.batched_allocate_layer_pages(
@@ -1824,9 +1830,17 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
                 allocated_pages.extend(allocated)
                 for position, page in zip(positions, allocated, strict=True):
                     pages_by_position[position] = page
-            return [page for page in pages_by_position if page is not None]
+            return [
+                page
+                for page in pages_by_position
+                if page is not None
+            ]
         count = token_counts[0]
-        shapes = [_layer_page_shape(full_shape, fmt, count, full_tokens=full_tokens)]
+        shapes = [
+            _layer_page_shape(
+                full_shape, fmt, count, full_tokens=full_tokens
+            )
+        ]
         return self._batched_allocate(
             shapes * num_layers,
             dtypes * num_layers,
@@ -1912,7 +1926,11 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
                     group_prefix_sum=group_prefix_sum,
                     raw_view_size=unit_aligned_size,
                     **({"num_layers": page_layers} if page_layers else {}),
-                    **({"valid_tokens": page_valid_tokens} if page_layers else {}),
+                    **(
+                        {"valid_tokens": page_valid_tokens}
+                        if page_layers
+                        else {}
+                    ),
                 )
             )
 
@@ -2808,7 +2826,7 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
     def __init__(
         self,
         size: int,
-        device="npu",
+        device="cuda",
         align_bytes: Optional[int] = None,
         use_paging: bool = False,
         **kwargs,
