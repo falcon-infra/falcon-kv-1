@@ -118,16 +118,6 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         if callable(configure):
             configure(enabled)
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        """
-        Initialize with the KV caches. Useful for pre-registering the
-        KV Caches in the KVConnector (e.g. for NIXL).
-
-        Args: kv_caches:
-            dictionary of layer names, kv cache
-        """
-        self._lmcache_engine.register_kv_caches(kv_caches)
-
     def _take_live_split_destination_plans(
         self, handled_groups: tuple[int, ...]
     ) -> dict[str, dict[str, Any]]:
@@ -361,6 +351,34 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         # completion bookkeeping is keyed by the primary group's block table.
         return self.request_finished(request, block_ids[0])
 
+
+    def register_kv_caches(self, kv_caches):
+        self._lmcache_engine.register_kv_caches(kv_caches)
+        impl = self._lmcache_engine
+        if impl._layerwise_prefill_dma:
+            from vllm.v1.core.dsa_shared_pool import (
+                DSASharedBlockLayout, layerwise_prefill_bundle_multiplier,
+            )
+            from lmcache_ascend.v1.npu_connector.layerwise_dma import (
+                build_group_cycles,
+                cache_page_size_bytes,
+            )
+
+            latent = impl._kvcaches_for_group(0)[0]
+            indexer = impl._kvcaches_for_group(1)[0]
+            # Match the scheduler's layout construction, including its slab split.
+            layout = DSASharedBlockLayout(
+                latent_page_size_bytes=cache_page_size_bytes(latent),
+                indexer_page_size_bytes=cache_page_size_bytes(indexer),
+                capacity_bundles=1,
+                bundle_multiplier=layerwise_prefill_bundle_multiplier(),
+            )
+            impl.lmcache_engine.gpu_connector.prefill_dma_cycles = build_group_cycles(
+                latent, indexer,
+                impl._lmcache_chunk_size,
+                layout.bundle_multiplier,
+                (layout.k_nope_dim, layout.k_pe_dim),
+            )
 
     @property
     def uses_layerwise_model_callbacks(self) -> bool:
