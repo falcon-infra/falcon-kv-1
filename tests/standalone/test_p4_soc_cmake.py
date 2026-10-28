@@ -75,4 +75,4 @@ def test_gate_precedes_native_subdirectories() -> None:
     source = (ROOT / "cmake/npu_extensions.cmake").read_text()
     assert source.index(
         'include("${CMAKE_CURRENT_LIST_DIR}/ascend_soc.cmake")'
-    ) < source.index("add_subdirectory(third_party/kvcache-ops)")
+    ) < source.index("add_subdirectory(csrc/graph)")

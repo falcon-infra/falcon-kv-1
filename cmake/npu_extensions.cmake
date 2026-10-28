@@ -30,7 +30,7 @@ else()
     message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 
-add_subdirectory(third_party/kvcache-ops)
+add_subdirectory(csrc/graph)
 
   add_subdirectory(csrc)
   set(TORCH_LIBS_DIR "${TORCH_PATH}/lib")
