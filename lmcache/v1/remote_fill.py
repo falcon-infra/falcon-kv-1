@@ -58,6 +58,7 @@ from lmcache.v1.storage_backend.local_cpu_backend import (
     LayerPageAdmissionRollbackError,
 )
 import torch
+from lmcache.v1.indexer_c8 import IndexerC8Layout
 
 
 logger = init_logger(__name__)
@@ -85,7 +86,21 @@ def remote_fill_tp_independent(
     ):
         return False
     dtypes = metadata.get_dtypes()
-    # C8/scale-plane representations are outside the replicated page contract.
+    c8 = getattr(metadata, "indexer_c8_layout", None)
+    if c8 is not None:
+        # G1 is loaded through its existing persistent key/scale path. Its
+        # precision policy and physical layer names remain in the layout tag;
+        # worker-local HBM block IDs are never part of the wire payload.
+        counts = getattr(metadata, "runtime_kv_group_layer_counts", None)
+        return (
+            isinstance(c8, IndexerC8Layout)
+            and len(dtypes) == 2
+            and dtypes[0] in (torch.float16, torch.bfloat16)
+            and dtypes[1] == torch.uint8
+            and counts is not None and len(counts) == 2
+            and all(type(count) is int and count > 0 for count in counts)
+            and (not c8.c8_layers or len(c8.c8_layers) == counts[1])
+        )
     return len(dtypes) in (1, 2) and all(
         dtype in (torch.float16, torch.bfloat16) for dtype in dtypes
     )
@@ -1613,6 +1628,7 @@ def create_decoder_remote_fill_runtime(
         descriptor_verification_capability
     )
     state = RemoteFillStateCore(
+        group_layer_counts=layout.group_layer_counts,
         destination_engine_epoch=destination_engine_epoch,
         shared_cache_generation=shared_cache_generation,
         descriptor_verification_key=verification_capability,

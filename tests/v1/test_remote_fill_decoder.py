@@ -61,6 +61,8 @@ from lmcache.v1.remote_fill_coordinator import (
     ProducerRequestState,
     RemoteFillCoordinator,
 )
+from lmcache.v1.remote_fill import AscendRemoteFillPageLifecycle, DecoderRemoteFillRuntime, DecoderRemoteFillServiceHost, RemoteFillDecoderLayout, RemoteFillGroupLayout, build_decoder_layout, build_remote_fill_negotiation_spec, create_decoder_remote_fill_runtime, remote_fill_token_hash_identity, remote_fill_tp_independent
+from lmcache.v1.indexer_c8 import IndexerC8Layout
 
 
 @pytest.mark.parametrize(
@@ -1890,6 +1892,7 @@ def test_runtime_tp_qualification_matches_negotiated_groups(
     replicated: bool,
     shared_group1: bool,
     source_tp: int,
+    indexer_policy: tuple[bool, ...] | None,
 ) -> None:
     """Runtime negotiation, including its legacy default, must keep paired TP strict."""
     monkeypatch.setenv("PYTHONHASHSEED", "0")
@@ -1904,6 +1907,10 @@ def test_runtime_tp_qualification_matches_negotiated_groups(
     metadata = _metadata(world_size=4)
     metadata.mla_cache_tp_replicated = replicated
     metadata.get_dtypes = lambda: [torch.bfloat16, torch.bfloat16]
+    if indexer_policy is not None:
+        metadata.indexer_c8_layout = IndexerC8Layout(c8_layers=indexer_policy)
+        metadata.runtime_kv_group_layer_counts = (2, 2)
+        metadata.get_dtypes = lambda: [torch.bfloat16, torch.uint8]
     layout = _layout()
     runtime = create_decoder_remote_fill_runtime(
         config=config,
@@ -2268,3 +2275,29 @@ def test_unequal_group_pages_allocate_and_publish_exact_bytes():
     for call in local.allocations:
         for page in call["pages"]:
             assert page.refs == 1 and page.pins == 0
+
+def test_c8_asymmetric_tp_requires_validated_packet(policy, invalid):
+    config = SimpleNamespace(
+        use_layerwise=True, dsa_two_groups=True, enable_sparse_attention=True,
+        dsa_group1_load_mode="persistent_direct_hbm", remote_url="mooncakestore://host",
+        extra_config=dict(enable_shared_cpu_cache=True, save_only_first_rank=True,
+                          mooncake_page_first_multi_buffer=True,
+                          mooncake_layer_merged_page_objects=True),
+    )
+    metadata = SimpleNamespace(
+        mla_cache_tp_replicated=True, use_mla=True,
+        indexer_c8_layout=IndexerC8Layout(c8_layers=policy),
+        runtime_kv_group_layer_counts=(79, 22),
+        get_dtypes=lambda: [torch.bfloat16, torch.uint8],
+    )
+    if invalid == "latent_dtype":
+        metadata.get_dtypes = lambda: [torch.uint8, torch.uint8]
+    elif invalid == "packet_dtype":
+        metadata.get_dtypes = lambda: [torch.bfloat16, torch.int8]
+    elif invalid == "counts":
+        metadata.runtime_kv_group_layer_counts = None
+    elif invalid == "policy_type":
+        metadata.indexer_c8_layout = object()
+    elif invalid == "policy_count":
+        metadata.indexer_c8_layout = IndexerC8Layout(c8_layers=(True, False))
+    assert remote_fill_tp_independent(config, metadata) is (invalid is None)
