@@ -3401,6 +3401,7 @@ def test_coordinator_ascend_preemption_preserves_real_engine_drop_ownership(fata
     adapter = object.__new__(LMCacheAscendConnectorV1Impl)
     adapter._parent = SimpleNamespace(has_connector_metadata=lambda: False)
     adapter.lmcache_engine = engine
+    adapter._parent = SimpleNamespace(has_connector_metadata=lambda: False)
     adapter.store_async = True
     adapter.kv_role = "kv_producer"
     adapter._drop_worker_retrieve_state = lambda _req: order.append("retrieve")
