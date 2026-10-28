@@ -2972,7 +2972,9 @@ class LMCacheConnectorV1Impl:
             self._normalize_dsa_kv_layer_groups()
             if self._is_dsa_two_groups():
                 engine = self.lmcache_engine
-                num_layers_for_group = getattr(engine, "num_layers_for_group", None)
+                num_layers_for_group = getattr(
+                    engine, "num_layers_for_group", None
+                )
                 if callable(num_layers_for_group):
                     runtime_group_counts = getattr(
                         engine.metadata,
@@ -10936,6 +10938,19 @@ class LMCacheConnectorV1Impl:
                 "_dsa_group1_direct_hbm_deferred_req_ids", req_id
             )
         resumed = getattr(request, "status", None) == RequestStatus.PREEMPTED
+        checkpoints = getattr(self, "_preemption_checkpoints", None)
+        checkpoint = checkpoints.get(req_id) if checkpoints else None
+        if checkpoint is not None and checkpoint.capture.generation == request.num_preemptions:
+            if checkpoint.status not in ("ready", "failed"):
+                if not checkpoint.expire(time.monotonic(), self.config.blocking_timeout_secs):
+                    return None
+                request.kv_resume_checkpoint = None
+                self._arm_preemption_controls()
+                self._resume_lookup_queries.pop(req_id, None)
+                if self.lookup_client is not None:
+                    self.lookup_client.clear_lookup_status(req_id)
+        else:
+            checkpoint = None
         prompt_token_ids = getattr(request, "prompt_token_ids", None)
         request_prompt_tokens = len(prompt_token_ids or ())
         query_end = request.num_tokens
@@ -10960,6 +10975,9 @@ class LMCacheConnectorV1Impl:
                     ):
                         query_end = decode_committed_end
                         query_scope = "decode_committed"
+                if checkpoint is not None and checkpoint.status == "ready":
+                    query_end = checkpoint.end
+                    query_scope = "preemption_checkpoint"
                 query = (query_end, query_scope, decode_committed_end)
                 self._resume_lookup_queries[req_id] = query
             query_end, query_scope, decode_committed_end = query
@@ -11010,6 +11028,9 @@ class LMCacheConnectorV1Impl:
                 token_ids = _apply_mm_hashes(token_ids, mm_hashes, mm_positions)
 
             request_configs = extract_request_configs(request.sampling_params)
+            if query_scope == "preemption_checkpoint":
+                request_configs = dict(request_configs or {})
+                request_configs[LOCAL_CHECKPOINT_CONFIG] = request.num_preemptions
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
@@ -11029,6 +11050,14 @@ class LMCacheConnectorV1Impl:
             )
             return None
 
+        if (
+            query_scope == "preemption_checkpoint"
+            and num_external_hit_tokens < query_end
+        ):
+            # A local offer is evictable while HBM admission is pending. Treat
+            # the fresh paired frontier as the query result, never the old offer.
+            query_end = lookup_query_tokens = num_external_hit_tokens
+            self._resume_lookup_queries[req_id] = (query_end, query_scope, decode_committed_end)
         lookup_started = self._cold_perf_lookup_started.pop(
             req_id,
             lookup_call_started,
@@ -11061,6 +11090,12 @@ class LMCacheConnectorV1Impl:
         # This will be removed in the future if vLLM's scheduler provides
         # a better support for this case.
         full_request_hit = num_external_hit_tokens == request.num_tokens
+        if (
+            query_scope == "preemption_checkpoint"
+            and num_external_hit_tokens == query_end
+            and query_end < request.num_tokens
+        ):
+            request.kv_resume_checkpoint = (request.num_preemptions, request.num_tokens, query_end)
         full_resumed_query_hit = (
             resumed
             and query_scope != "all_tokens"
@@ -11121,6 +11156,16 @@ class LMCacheConnectorV1Impl:
                 self, "_dsa_kv_policy_threshold", 0
             )
         )
+        if (
+            query_scope == "preemption_checkpoint"
+            and num_external_hit_tokens > request_prompt_tokens
+            and not dsa_cold_compact_load
+        ):
+            checkpoint.status = "failed"
+            request.kv_resume_checkpoint = None
+            self._resume_lookup_queries.pop(req_id, None)
+            self.lookup_client.clear_lookup_status(req_id)
+            return None
         group1_direct_hbm = bool(
             dsa_cold_compact_load
             and getattr(
@@ -11178,6 +11223,12 @@ class LMCacheConnectorV1Impl:
             can_load=False,
             dsa_current_released_frontier=0,
         )
+        if (
+            query_scope == "preemption_checkpoint"
+            and num_external_hit_tokens > request_prompt_tokens
+        ):
+            self.load_specs[req_id].checkpoint_generation = request.num_preemptions
+            self.load_specs[req_id].checkpoint_prefix_end = request_prompt_tokens
         if dsa_cold_compact_load:
             self.load_specs[req_id].dsa_cold_compact_load = True
             self.load_specs[req_id].dsa_group1_direct_hbm = group1_direct_hbm

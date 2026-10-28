@@ -1256,70 +1256,40 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         dtype: torch.dtype,
         fmt: MemoryFormat,
         cached_positions: Iterable[int],
-        previous: Optional[LayerPageMemoryObj] = None,
+        layer_shapes: Optional[list[torch.Size]] = None,
     ) -> LayerPageMemoryObj:
-        """Create a compact all-layer view, borrowing an exact prior view.
-
-        The caller validates the batch envelope and expected chunk metadata.
-        Reuse preserves the existing request-owned reference and page identity.
-        """
+        """Create one passive all-layer view from a compact page descriptor."""
         if not 0 <= chunk_index < len(batch.page_offsets):
             raise SharedCPUCacheValidationError("Invalid compact page chunk index")
-        if batch.shm_name != self.shm_name:
-            raise SharedCPUCacheValidationError("Invalid compact page slab")
         offset = batch.page_offsets[chunk_index]
         physical_size = batch.page_physical_sizes[chunk_index]
         layer_size = shape.numel() * dtype.itemsize
+        shapes = [shape] * batch.num_layers if layer_shapes is None else layer_shapes
         logical_size = layer_size * batch.num_layers
+        if layer_shapes is not None:
+            if (
+                len(shapes) != batch.num_layers
+                or not shapes
+                or shapes[0] != shape
+                or any(s.numel() <= 0 for s in shapes)
+            ):
+                raise SharedCPUCacheValidationError("Invalid compact page layer shapes")
+            logical_size = sum(s.numel() * dtype.itemsize for s in shapes)
         if (
             layer_size != batch.physical_sizes[chunk_index]
             or logical_size <= 0
             or logical_size > physical_size
-            or offset < 0
-            or offset + physical_size > self.slab_size
         ):
             raise SharedCPUCacheValidationError(
                 "Invalid compact page logical size: "
                 f"logical_size={logical_size}, physical_size={physical_size}"
             )
-        cached_positions = (
-            cached_positions
-            if isinstance(cached_positions, range)
-            else tuple(cached_positions)
-        )
-        position_identity = (
-            (
-                "range",
-                cached_positions.start,
-                cached_positions.stop,
-                cached_positions.step,
-            )
-            if isinstance(cached_positions, range)
-            else ("positions", cached_positions)
-        )
-        descriptor = (
-            self.shm_name,
-            self.generation,
-            batch.producer_rank,
-            batch.chunk_hashes[chunk_index],
-            batch.num_layers,
-            offset,
-            physical_size,
-            shape,
-            dtype,
-            fmt,
-            position_identity,
-        )
-        if self._matches_view(
-            previous, descriptor, shape, dtype, fmt, offset, physical_size
-        ):
-            assert previous is not None
-            return previous
-        if not cached_positions:
+        positions = tuple(cached_positions)
+        if not positions:
             raise SharedCPUCacheValidationError(
                 "Compact layer page must contain at least one token"
             )
-        view = LayerPageMemoryObj(
+        return LayerPageMemoryObj(
             raw_data=None,
             metadata=MemoryObjMetadata(
                 shape=shape,
@@ -1329,26 +1299,15 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
                 ref_count=1,
                 pin_count=0,
                 fmt=fmt,
-                cached_positions=(
-                    torch.arange(
-                        cached_positions.start,
-                        cached_positions.stop,
-                        cached_positions.step,
-                        dtype=torch.int64,
-                    )
-                    if isinstance(cached_positions, range)
-                    else torch.tensor(cached_positions, dtype=torch.int64)
-                ),
-                shapes=[shape] * batch.num_layers,
+                cached_positions=torch.tensor(positions, dtype=torch.int64),
+                shapes=shapes,
                 dtypes=[dtype] * batch.num_layers,
             ),
             parent_allocator=self,
             num_layers=batch.num_layers,
             raw_view_size=logical_size,
-            valid_tokens=len(cached_positions),
+            valid_tokens=len(positions),
         )
-        self._view_descriptors[view] = descriptor
-        return view
 
     def allocate(
         self,
