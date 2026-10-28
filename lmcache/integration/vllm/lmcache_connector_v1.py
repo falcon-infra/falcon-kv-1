@@ -365,7 +365,17 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
             )
 
             latent = impl._kvcaches_for_group(0)[0]
-            indexer = impl._kvcaches_for_group(1)[0]
+            indexer_layers = impl._kvcaches_for_group(1)
+            # DMA cycle geometry stays in canonical BF16 logical units. Mixed
+            # C8 rows use prepared packets; their INT8+scale tuple is not a raw
+            # plane-width descriptor and must never define this geometry.
+            indexer = next(
+                (layer for layer in indexer_layers if len(layer) == 1), None
+            )
+            if indexer is None:
+                raise ValueError(
+                    "Uniform-C8 banked prefill requires explicit logical geometry"
+                )
             # Match the scheduler's layout construction, including its slab split.
             layout = DSASharedBlockLayout(
                 latent_page_size_bytes=cache_page_size_bytes(latent),

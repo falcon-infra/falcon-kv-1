@@ -1253,6 +1253,22 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         use_gpu: bool = False,
         **kwargs,
     ):
+        self.indexer_c8_layout = kwargs.pop("indexer_c8_layout", None)
+        self.indexer_hbm_block_map = kwargs.pop("indexer_hbm_block_map", None)
+        mapping = self.indexer_hbm_block_map
+        if mapping is not None and (
+            self.indexer_c8_layout is None
+            or not self.indexer_c8_layout.mixed
+            or not isinstance(mapping, tuple)
+            or not mapping
+            or len(mapping) % 18
+            or any(type(b) is not int for b in mapping)
+            or mapping[0] != 0
+            or set(mapping) != set(range(len(mapping)))
+        ):
+            raise ValueError(
+                "Paired-bank HBM layout requires a complete mixed-C8 block permutation"
+            )
         self._common_init(hidden_dim_size, num_layers, use_gpu, **kwargs)
 
         self._prefill_worker_id = int(kwargs.get("worker_id", -1))
@@ -2413,7 +2429,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
 
         if total_tokens <= 0:
             total_tokens = self._sparse_total_tokens_from_layer_chunks(
-                layer_tensors, kv_group
+                layer_tensors, kv_group, layer_id
             )
 
         state_key = self._sparse_direct_state_key(
@@ -2777,7 +2793,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         chunk_sizes: list[int] = []
         covered_tokens = 0
         for tensor in layer_tensors:
-            chunk_tokens = self._lmc_plane_num_tokens(tensor, kv_group)
+            chunk_tokens = self._lmc_plane_num_tokens(tensor, kv_group, layer_id)
             chunk_offsets.append(covered_tokens)
             chunk_sizes.append(chunk_tokens)
             covered_tokens += chunk_tokens
@@ -3339,6 +3355,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         layer_tensors: List[torch.Tensor],
         direction: bool,
         destination_plan: Optional[_SparseDestinationPlan] = None,
+        c8_chunk_capacity: int = 0,
         defer_consumer_wait: bool = False,
         require_prepared_state: bool = False,
         prepared_layer_state: Any = None,
@@ -3361,6 +3378,44 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             chunk_offsets_npu.record_stream(transfer_stream)
             if chunk_sizes_npu is not chunk_offsets_npu:
                 chunk_sizes_npu.record_stream(transfer_stream)
+
+        if kv_group == 1 and getattr(self, "indexer_c8_layout", None) is not None:
+            if total_tokens != num_tokens:
+                raise ValueError("C8 transfer requires an exact slot-mapping window")
+            if defer_consumer_wait:
+                raise RuntimeError("Deferred C8 requires prepared bank FIFO packets")
+            if destination_plan is None:
+                destination_plan = self._get_or_create_sparse_destination_plan(
+                    kvcaches_ref=kvcaches_ref,
+                    kv_group=kv_group,
+                    slot_mapping_ref=slot_mapping_full,
+                    sparse_kv_format=dense_kv_format,
+                    sparse_k_hidden_dims=dense_k_hidden_dims,
+                    sparse_v_hidden_dims=dense_v_hidden_dims,
+                    sparse_dsa_hidden_dims=dense_dsa_hidden_dims,
+                    expected_device=kvcaches_ref[layer_id][0].device,
+                )
+            capacity = fixed_chunk_size or c8_chunk_capacity
+            if capacity <= 0:
+                raise ValueError(
+                    "C8 transfer requires the validated maximum chunk size"
+                )
+            with self._stream_context_or_null(transfer_stream):
+                if transfer_stream is not current_stream:
+                    transfer_stream.wait_stream(current_stream)
+                lmc_ops.indexer_c8_transfer_prepared(
+                    destination_plan.states[layer_id],
+                    chunk_ptrs_npu,
+                    chunk_offsets_npu,
+                    chunk_sizes_npu,
+                    slot_mapping_full,
+                    capacity,
+                    direction,
+                    fixed_chunks=bool(fixed_chunk_size),
+                )
+            if transfer_stream is not current_stream:
+                current_stream.wait_stream(transfer_stream)
+            return
 
         if destination_plan is not None:
             if direction:
@@ -4701,6 +4756,25 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         device: Optional[torch.device] = None,
         layout_hints: Optional[LayoutHints] = None,
     ) -> "VLLMPagedMemLayerwiseNPUConnector":
+        if getattr(metadata, "indexer_c8_layout", None) is not None and not all(
+            hasattr(lmc_ops, name)
+            for name in (
+                "IndexerC8State",
+                "IndexerC8GroupState",
+                "indexer_c8_transfer_prepared",
+                "indexer_c8_group_transfer_prepared",
+            )
+        ):
+            raise RuntimeError(
+                "Indexer C8 requires rebuilding the LMCache-Ascend native extension"
+            )
+        if (
+            getattr(metadata, "indexer_hbm_block_map", None) is not None
+            and getattr(lmc_ops, "INDEXER_C8_BLOCK_MAP_ABI", 0) < 1
+        ):
+            raise RuntimeError(
+                "Paired-bank C8 requires rebuilding the LMCache-Ascend native extension"
+            )
         num_layers = metadata.kv_shape[0]
         chunk_size = metadata.kv_shape[2]
         num_kv_head = metadata.kv_shape[3]
@@ -4717,6 +4791,8 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             use_mla=metadata.use_mla,
             layout_hints=layout_hints,
             max_staging_tokens=max_staging_tokens,
+            indexer_c8_layout=getattr(metadata, "indexer_c8_layout", None),
+            indexer_hbm_block_map=getattr(metadata, "indexer_hbm_block_map", None),
             worker_id=metadata.worker_id,
         )
 
@@ -5157,6 +5233,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             deferred_dense_direct_get
             and kwargs.get("prefill_dma_block_ids_by_bank") is not None
         )
+        prefill_packet = prefill_dma and layout.indexer_c8
         if prefill_dma and not hasattr(lmc_ops, "layerwise_prefill_dma_copy"):
             raise RuntimeError(
                 "LMCache-Ascend must be rebuilt for layerwise prefill DMA"
@@ -5252,12 +5329,13 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         chunk_offsets_npu: Optional[torch.Tensor] = None
         chunk_sizes_npu: Optional[torch.Tensor] = None
         dense_fixed_chunk_size = 0
+        c8_chunk_capacity = max(chunk_sizes) if layout.indexer_c8 else 0
         dma_plans = None
         dma_req_id = kwargs.get("req_id") if prefill_dma else None
         bound_loads = None
         plan_cache = source_cache = None
         plan_mode = "full"
-        reuse_debug = prefill_dma and prefill_reuse_debug_enabled(
+        reuse_debug = prefill_dma and not prefill_packet and prefill_reuse_debug_enabled(
             getattr(self, "_prefill_worker_id", -1)
         )
         if reuse_debug:
@@ -5265,7 +5343,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             debug_reused = debug_rebuilt = debug_layers = 0
             debug_submit_ms = 0.0
             debug_layer_count = min(2, self._expected_group_layers(kv_group))
-        if prefill_dma:
+        if prefill_dma and not prefill_packet:
             if isinstance(dma_req_id, str) and dma_req_id:
                 bound_loads = self._prefill_dma_bound_loads.setdefault(dma_req_id, {})
                 if not hasattr(self, "_prefill_dma_plan_cache"):
@@ -5292,7 +5370,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                                 bound_loads.pop(cache_key)
                                 if reuse_debug:
                                     debug_map_drops += 1
-        if dense_direct and not prefill_dma:
+        if (dense_direct or layout.indexer_c8) and not prefill_dma:
             (
                 dense_fixed_chunk_size,
                 chunk_offsets_npu,
@@ -5336,6 +5414,21 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                 )
             )
 
+        prefill_packets = None
+        if prefill_packet:
+            packet_sources = kwargs.get("prefill_c8_memory_objs")
+            if packet_sources is None:
+                raise ValueError("Banked mixed-C8 load requires preprepared per-layer sources")
+            packet_sources = tuple(
+                tuple(_layer_source_memory_objs(row, layer_id))
+                for layer_id, row in enumerate(packet_sources)
+            )
+            prefill_packets = self._prepare_prefill_c8_packets(
+                layout=layout, kvcaches=kvcaches_snapshot, memory_objs=packet_sources,
+                block_ids_by_bank=kwargs["prefill_dma_block_ids_by_bank"],
+                block_size=int(kwargs["prefill_dma_block_size"]), starts=starts, ends=ends,
+                transfer_stream=self.load_stream,
+            )
         deferred_load_submitted = False
         deferred_load_completed = False
         try:
@@ -5398,6 +5491,10 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                         kvcaches_ref=kvcaches_snapshot,
                     )
                 source_objs = _layer_source_memory_objs(memory_objs_layer, layer_id)
+                if prefill_packet and tuple(map(id, source_objs)) != tuple(map(
+                    id, _layer_source_memory_objs(packet_sources[layer_id], layer_id)
+                )):
+                    raise RuntimeError("Banked C8 source changed after packet preparation")
                 if deferred_dense_direct_get and req_id is not None:
                     owners = self._layerwise_prefill_load_owners.setdefault(
                         str(req_id), {}
@@ -5448,7 +5545,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                     logger.debug("Finished loading layer %d", layer_id - 1)
                 # memobj -> gpu_buffer -> kvcaches
                 if prefill_dma:
-                    assert dma_plans is not None
+                    assert prefill_packets is not None or dma_plans is not None
                     diagnose_bank_load = (
                         layer_id < 2 and prefill_start_timing_enabled()
                     )
@@ -5473,11 +5570,29 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                         bind_started = time.perf_counter()
                     if reuse_debug and layer_id < debug_layer_count:
                         debug_submit_started = time.perf_counter()
-                    source_metadata = None
-                    if source_cache is not None:
-                        source_key = (kv_group, layer_id)
-                        source_metadata = prepare_source_addresses(
-                            source_objs, starts, ends,
+                    bind_ms = 0.0
+                    if not prefill_packet:
+                        source_metadata = None
+                        if source_cache is not None:
+                            source_key = (kv_group, layer_id)
+                            source_metadata = prepare_source_addresses(
+                                source_objs, starts, ends,
+                                lambda obj, layer_id=layer_id: (
+                                    int(obj.layer_data_ptr(layer_id))
+                                    if isinstance(obj, LayerPageMemoryObj)
+                                    else int(obj.data_ptr)
+                                ),
+                                lambda obj, layer_id=layer_id: self._lmc_plane_num_tokens(
+                                    _layer_memory_tensor(obj, layer_id), kv_group
+                                ),
+                                source_cache.get(source_key),
+                            )
+                            source_cache[source_key] = source_metadata
+                        bound = bind_incremental_copy_addresses(
+                            dma_plans[bank], source_objs, starts, ends,
+                            [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
+                            self.checkpoint_plane_widths(kv_group),
+                            int(kvcaches_snapshot[layer_id][0].element_size()),
                             lambda obj, layer_id=layer_id: (
                                 int(obj.layer_data_ptr(layer_id))
                                 if isinstance(obj, LayerPageMemoryObj)
@@ -5486,39 +5601,23 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                             lambda obj, layer_id=layer_id: self._lmc_plane_num_tokens(
                                 _layer_memory_tensor(obj, layer_id), kv_group
                             ),
-                            source_cache.get(source_key),
+                            (
+                                bound_loads.get((kv_group, layer_id, bank))
+                                if bound_loads is not None else None
+                            ),
+                            slot_prefix_unchanged=bound_loads is not None,
+                            source_metadata=source_metadata,
+                            reuse_rows_in_place=bound_loads is not None,
                         )
-                        source_cache[source_key] = source_metadata
-                    bound = bind_incremental_copy_addresses(
-                        dma_plans[bank], source_objs, starts, ends,
-                        [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
-                        self.checkpoint_plane_widths(kv_group),
-                        int(kvcaches_snapshot[layer_id][0].element_size()),
-                        lambda obj, layer_id=layer_id: (
-                            int(obj.layer_data_ptr(layer_id))
-                            if isinstance(obj, LayerPageMemoryObj)
-                            else int(obj.data_ptr)
-                        ),
-                        lambda obj, layer_id=layer_id: self._lmc_plane_num_tokens(
-                            _layer_memory_tensor(obj, layer_id), kv_group
-                        ),
-                        (
-                            bound_loads.get((kv_group, layer_id, bank))
-                            if bound_loads is not None else None
-                        ),
-                        slot_prefix_unchanged=bound_loads is not None,
-                        source_metadata=source_metadata,
-                        reuse_rows_in_place=bound_loads is not None,
-                    )
-                    if bound_loads is not None:
-                        bound_loads[(kv_group, layer_id, bank)] = bound
-                    copies = bound.rows
-                    if diagnose_bank_load:
-                        bind_ms = (time.perf_counter() - bind_started) * 1000
-                    if reuse_debug and layer_id < debug_layer_count:
-                        debug_reused += bound.reused_chunks
-                        debug_rebuilt += len(source_objs) - bound.reused_chunks
-                        debug_layers += 1
+                        if bound_loads is not None:
+                            bound_loads[(kv_group, layer_id, bank)] = bound
+                        copies = bound.rows
+                        if diagnose_bank_load:
+                            bind_ms = (time.perf_counter() - bind_started) * 1000
+                        if reuse_debug and layer_id < debug_layer_count:
+                            debug_reused += bound.reused_chunks
+                            debug_rebuilt += len(source_objs) - bound.reused_chunks
+                            debug_layers += 1
                     # Attention already queued the exact last-use event on
                     # this bank FIFO, on every TP rank. Do not snapshot the
                     # current compute stream here: it can include N's FFN or
@@ -5532,7 +5631,12 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                         deferred_load_submitted = True
                         if diagnose_bank_load:
                             native_enqueue_started = time.perf_counter()
-                        lmc_ops.layerwise_prefill_dma_copy(copies, False)
+                        if prefill_packet:
+                            self._submit_prefill_c8_packet(
+                                prefill_packets, layer_id, bank, bank_stream, False,
+                            )
+                        else:
+                            lmc_ops.layerwise_prefill_dma_copy(copies, False)
                         if diagnose_bank_load:
                             native_enqueue_ms = (
                                 time.perf_counter() - native_enqueue_started
@@ -5589,7 +5693,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                             plan=plan_mode,
                             ms=debug_submit_ms,
                         )
-                elif dense_direct:
+                elif dense_direct or layout.indexer_c8:
                     if deferred_dense_direct_get:
                         bank = self._layerwise_prefill_bank(
                             layer_id, kv_group, layerwise_prefill_bank_offset
@@ -5606,7 +5710,16 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                         ):
                             with self._stream_context_or_null(self.load_stream):
                                 self.load_stream.wait_event(previous_save[1])
-                    if pointer_first:
+                    if layout.indexer_c8 and staging_tensor is not None:
+                        _, chunk_ptrs_npu = self._prepare_c8_staging_packets(
+                            cpu_tensors,
+                            staging_tensor,
+                            chunk_sizes,
+                            self.load_stream,
+                            False,
+                            layout.layer_token_bytes[layer_id],
+                        )
+                    elif pointer_first:
                         chunk_ptrs_npu = self._resolve_sparse_chunk_ptrs_npu(
                             layer_id,
                             cpu_tensors,
@@ -5653,6 +5766,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                         layer_tensors=cpu_tensors,
                         direction=False,
                         destination_plan=destination_plan,
+                        c8_chunk_capacity=c8_chunk_capacity,
                         defer_consumer_wait=deferred_dense_direct_get,
                     )
                     if deferred_dense_direct_get:
@@ -6324,9 +6438,17 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             total_tokens = (
                 lmcache_cached_tokens
                 if lmcache_cached_tokens > 0
-                else self._sparse_total_tokens_from_layer_chunks(cpu_tensors, kv_group)
+                else self._sparse_total_tokens_from_layer_chunks(
+                    cpu_tensors, kv_group, layer_id
+                )
             )
-            if (
+            if layout.indexer_c8:
+                self._run_c8_indexer_bootstrap(
+                    bootstrap_destination_plan, chunk_ptrs_npu, layer_id,
+                    slot_mapping_packed, total_tokens, chunk_size,
+                    has_explicit_sparse_selection,
+                )
+            elif (
                 bootstrap_destination_plan is not None
                 and self._active_sparse_load_join is None
             ):
@@ -6492,7 +6614,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                     )
             if _mtp_dw_diag_enabled() and layer_id == 0:
                 actual_cpu_tokens = self._sparse_total_tokens_from_layer_chunks(
-                    cpu_tensors, kv_group
+                    cpu_tensors, kv_group, layer_id
                 )
                 diag_selected = selected_token_idx.detach().cpu().reshape(-1)
                 selected_count = int(diag_selected.numel())
@@ -6570,7 +6692,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                 slot_values = deep_diag["slot_values"]
                 conflicts = deep_diag["conflicts"]
                 actual_cpu_tokens = self._sparse_total_tokens_from_layer_chunks(
-                    cpu_tensors, kv_group
+                    cpu_tensors, kv_group, layer_id
                 )
                 raw_window = os.environ.get(
                     "LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0"
@@ -6745,6 +6867,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             and not dense_direct
         ):
             raise RuntimeError("Layerwise prefill DMA requires dense direct store")
+        prefill_packet = prefill_dma and layout.indexer_c8
         if prefill_dma and not hasattr(lmc_ops, "layerwise_prefill_dma_copy"):
             raise RuntimeError(
                 "LMCache-Ascend must be rebuilt for layerwise prefill DMA"
@@ -6796,7 +6919,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             slot_mapping_full=slot_mapping_full,
             kvcaches_ref=kvcaches_snapshot,
         )
-        if dense_direct and not prefill_dma:
+        if (dense_direct or layout.indexer_c8) and not prefill_dma:
             slot_mapping_full = self._slot_mapping_on_kv_device(
                 slot_mapping_full, self.store_stream
             )
@@ -6816,15 +6939,16 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         chunk_offsets_npu: Optional[torch.Tensor] = None
         chunk_sizes_npu: Optional[torch.Tensor] = None
         dense_fixed_chunk_size = 0
+        c8_chunk_capacity = max(chunk_sizes) if layout.indexer_c8 else 0
         dma_plans = None
-        if prefill_dma:
+        if prefill_dma and not prefill_packet:
             dma_plans = _prefill_dma_plans(
                 kwargs["prefill_dma_block_ids_by_bank"],
                 int(kwargs["prefill_dma_block_size"]),
                 starts, ends, 0, chunk_sizes, kv_group, kvcaches_snapshot, "store",
                 self.prefill_dma_cycles[kv_group],
             )
-        if dense_direct and not prefill_dma:
+        if (dense_direct or layout.indexer_c8) and not prefill_dma:
             (
                 dense_fixed_chunk_size,
                 chunk_offsets_npu,
@@ -6967,8 +7091,16 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             deferred_dense_layer_states: List[Any] = []
             deferred_dense_validation_keys: List[tuple] = []
             deferred_dma_copies: List[List[tuple[int, int, int]]] = []
+            prefill_packets = None
             if deferred_layerwise_put and dense_direct:
-                if prefill_dma:
+                if prefill_packet:
+                    prefill_packets = self._prepare_prefill_c8_packets(
+                        layout=layout, kvcaches=kvcaches_snapshot, memory_objs=memory_objs,
+                        block_ids_by_bank=kwargs["prefill_dma_block_ids_by_bank"],
+                        block_size=int(kwargs["prefill_dma_block_size"]), starts=starts, ends=ends,
+                        transfer_stream=self.store_stream,
+                    )
+                elif prefill_dma:
                     assert dma_plans is not None
                     widths = self.checkpoint_plane_widths(kv_group)
                     # Layer pages already expose their physical layout and
@@ -7174,10 +7306,16 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                     with torch.npu.stream(bank_stream):
                         # The final-access event is already ahead of us on
                         # the bank FIFO; do not wait for later compute here.
-                        lmc_ops.layerwise_prefill_dma_copy(
-                            deferred_dma_copies[layer_id], True
-                        )
-                elif dense_direct:
+                        if prefill_packet:
+                            self._submit_prefill_c8_packet(
+                                prefill_packets, layer_id, bank, bank_stream, True,
+                            )
+                        else:
+                            lmc_ops.layerwise_prefill_dma_copy(
+                                deferred_dma_copies[layer_id], True
+                            )
+                elif dense_direct or layout.indexer_c8:
+                    staged_views = None
                     if deferred_layerwise_put:
                         assert deferred_dense_layer_tensors is not None
                         cpu_tensors = deferred_dense_layer_tensors[layer_id]
@@ -7222,6 +7360,11 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                             layer_id,
                             cpu_tensors,
                         )
+                    if layout.indexer_c8 and staging_tensor is not None:
+                        staged_views, chunk_ptrs_npu = self._prepare_c8_staging_packets(
+                            cpu_tensors, staging_tensor, chunk_sizes, self.store_stream,
+                            True, layout.layer_token_bytes[layer_id],
+                        )
                     assert chunk_offsets_npu is not None
                     assert chunk_sizes_npu is not None
                     self._run_dense_direct_kv_transfer_layer(
@@ -7245,6 +7388,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                         dense_host_interleaved=dense_host_interleaved,
                         layer_tensors=cpu_tensors,
                         direction=True,
+                        c8_chunk_capacity=c8_chunk_capacity,
                         defer_consumer_wait=deferred_layerwise_put,
                         require_prepared_state=deferred_layerwise_put,
                         prepared_layer_state=(
@@ -7258,6 +7402,14 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                             else None
                         ),
                     )
+                    if staged_views is not None:
+                        with self._stream_context_or_null(self.store_stream):
+                            for target, view in zip(
+                                cpu_tensors, staged_views, strict=True
+                            ):
+                                target.view(-1)[: view.numel()].copy_(
+                                    view, non_blocking=True
+                                )
                     logger.debug("Finished offloading layer %d", layer_id)
                 else:
                     # Preserve the ordinary paged transfer path for D nodes
@@ -8161,6 +8313,115 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
     def supports_layerwise_prefill_transfer_window(self) -> bool:
         """Whether the connector can honor the two-bank transfer protocol."""
         return not (_DENSE_DIRECT_LOAD_DISABLE or _DENSE_DIRECT_STORE_DISABLE)
+
+    def _submit_prefill_c8_packet(self, prepared, layer_id, bank, stream, direction):
+        state, pointers, offsets, counts, slots_by_bank, capacity = prepared[layer_id]
+        slots = slots_by_bank[bank]
+        for tensor in (pointers, offsets, counts, slots):
+            tensor.record_stream(stream)
+        lmc_ops.indexer_c8_transfer_prepared(
+            state, pointers, offsets, counts, slots, capacity, direction,
+            fixed_chunks=False,
+        )
+
+    def _prepare_prefill_c8_packets(
+        self, *, layout, kvcaches, memory_objs, block_ids_by_bank,
+        block_size, starts, ends, transfer_stream,
+    ):
+        """Prepare complete key/scale packets before the transfer-window yield.
+
+        Native packet scales follow the physical key capacity, not the valid
+        tail length. Pad each chunk's mapping with excluded slots so retained
+        pages keep that offset while only requested rows are transferred.
+        """
+        if not self.indexer_c8_layout.mixed:
+            raise ValueError("Uniform-C8 banked prefill needs an explicit logical capacity")
+        if getattr(self, "indexer_hbm_block_map", None) is not None:
+            raise ValueError("Banked prefill requires BF16 logical IDs, not a paired map")
+        if len(block_ids_by_bank) != 2 or block_size != 128:
+            raise ValueError("Banked C8 requires two logical bank maps with 128-token blocks")
+        if any(factor != (2 if self.indexer_c8_layout.is_c8(i) else 1)
+               for i, factor in enumerate(layout.layer_slot_factors)):
+            raise ValueError("Banked mixed-C8 requires factor-2 INT8 and factor-1 BF16 views")
+        if len(memory_objs) != len(kvcaches):
+            raise ValueError("Banked C8 requires prepared source rows for every layer")
+        logical_capacity = next(
+            int(layer[0].shape[0]) * block_size
+            for i, layer in enumerate(kvcaches)
+            if not self.indexer_c8_layout.is_c8(i)
+        )
+        if len(starts) != len(ends):
+            raise ValueError("Banked C8 chunk range lengths disagree")
+        # Logical rows are identical across owners. Build each bank once on
+        # CPU, then share immutable padded metadata for equal packet capacities
+        # within this preparation only (never across requests or steps).
+        valid_slots_by_bank = []
+        for blocks in block_ids_by_bank:
+            blocks_cpu = torch.as_tensor(blocks, dtype=torch.long, device="cpu")
+            rows = []
+            for start, end in zip(starts, ends, strict=True):
+                if start < 0 or end <= start or end > len(blocks) * block_size:
+                    raise ValueError("Banked C8 range exceeds logical block table")
+                positions = torch.arange(start, end, dtype=torch.long, device="cpu")
+                slots = blocks_cpu.index_select(0, positions // block_size)
+                slots = slots * block_size + positions % block_size
+                if bool(((slots < 0) | (slots >= logical_capacity)).any()):
+                    raise ValueError("Banked C8 logical slot exceeds registered capacity")
+                rows.append(slots)
+            valid_slots_by_bank.append(rows)
+        metadata_by_capacity = {}
+        prepared = []
+        # This snapshot is before model execution, never in a layer callback.
+        transfer_stream.wait_stream(torch.npu.current_stream())
+        with self._stream_context_or_null(transfer_stream):
+            for layer_id, (layer, objects) in enumerate(zip(kvcaches, memory_objs, strict=True)):
+                objects = _layer_source_memory_objs(objects, layer_id)
+                if len(objects) != len(starts) or len(starts) != len(ends):
+                    raise ValueError("Banked C8 packet count disagrees with chunk ranges")
+                capacities, pointers = [], []
+                for chunk_id, (obj, start, end) in enumerate(zip(objects, starts, ends, strict=True)):
+                    tensor = _layer_memory_tensor(obj, layer_id)
+                    packet_bytes = tensor.numel() * tensor.element_size()
+                    width = layout.layer_token_bytes[layer_id]
+                    capacity, remainder = divmod(packet_bytes, width)
+                    if remainder or not 0 < end - start <= capacity:
+                        raise ValueError("Banked C8 packet has invalid physical/valid capacity")
+                    capacities.append(capacity)
+                    pointers.append(self._resolve_registered_cpu_source_device_ptr(
+                        obj, layer_id=layer_id, chunk_index=chunk_id,
+                        source="_prepare_prefill_c8_packets",
+                    ))
+                capacity_key = tuple(capacities)
+                metadata = metadata_by_capacity.get(capacity_key)
+                if metadata is None:
+                    offsets, cursor = [], 0
+                    for capacity in capacities:
+                        offsets.append(cursor)
+                        cursor += capacity
+                    slots_by_bank = []
+                    for rows in valid_slots_by_bank:
+                        slots = torch.full((cursor,), -1, dtype=torch.long, device="cpu")
+                        for offset, valid_slots in zip(offsets, rows, strict=True):
+                            slots[offset:offset + valid_slots.numel()].copy_(valid_slots)
+                        slots_by_bank.append(slots.to(device=layout.kv_device))
+                    metadata = (
+                        torch.tensor(offsets, dtype=torch.long, device=layout.kv_device),
+                        torch.tensor(capacities, dtype=torch.long, device=layout.kv_device),
+                        tuple(slots_by_bank), max(capacities, default=0),
+                    )
+                    metadata_by_capacity[capacity_key] = metadata
+                state = lmc_ops.IndexerC8State(
+                    layer[0], layer[1] if len(layer) == 2 else None,
+                    layout.layer_slot_factors[layer_id],
+                )
+                prepared.append((state,
+                    torch.tensor(pointers, dtype=torch.long, device=layout.kv_device),
+                    *metadata))
+            ready = torch.npu.Event()
+            ready.record(transfer_stream)
+        for bank in range(2):
+            self._layerwise_prefill_dma_stream(1, bank).wait_event(ready)
+        return prepared
 
 def _prefill_dma_plans(
     block_ids_by_bank: Sequence[Sequence[int]],
