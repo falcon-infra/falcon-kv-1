@@ -5257,6 +5257,14 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                     bank_stream = self._layerwise_prefill_dma_stream(
                         kv_group, bank
                     )
+                    bank_tails = getattr(
+                        self, "_layerwise_prefill_bank_tail_events", {}
+                    )
+                    previous_tail = bank_tails.get((kv_group, bank))
+                    previous_tail_pending = bool(
+                        previous_tail is not None
+                        and not previous_tail[1].query()
+                    )
                     bound = bind_incremental_copy_addresses(
                         dma_plans[bank], source_objs, starts, ends,
                         [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
@@ -5296,6 +5304,20 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                     load_done[(kv_group, layer_id)] = (
                         layerwise_prefill_generation, load_done_event,
                     )
+                    if layer_id == 0 and prefill_start_timing_enabled():
+                        prefill_start_timing_log(
+                            logger,
+                            "first_bank_load_submit",
+                            time.perf_counter(),
+                            kv_group=kv_group,
+                            layer_id=layer_id,
+                            bank=bank,
+                            previous_tail_pending=previous_tail_pending,
+                            previous_tail_layer=(
+                                previous_tail[2]
+                                if previous_tail is not None else None
+                            ),
+                        )
                 elif dense_direct:
                     if deferred_dense_direct_get:
                         bank = self._layerwise_prefill_bank(layer_id, kv_group)
@@ -6959,6 +6981,20 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                             layerwise_prefill_generation,
                             bank_done_event,
                         )
+                        bank_tails = getattr(
+                            self, "_layerwise_prefill_bank_tail_events", None
+                        )
+                        if bank_tails is None:
+                            bank_tails = {}
+                            self._layerwise_prefill_bank_tail_events = (
+                                bank_tails
+                            )
+                        bank_tails[(kv_group, bank)] = (
+                            layerwise_prefill_generation,
+                            bank_done_event,
+                            layer_id,
+                            kwargs.get("req_id"),
+                        )
                     else:
                         # The fallback path owns only one reusable staging
                         # tensor and has no compute-entry bank protocol.
@@ -7141,6 +7177,74 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         return tuple(
             latest_by_bank[bank][1] for bank in sorted(latest_by_bank)
         )
+
+    def wait_for_layerwise_prefill_load(
+        self,
+        layer_id: int,
+        kv_group: int,
+    ) -> None:
+        """Order a layer consumer after its asynchronous P-node bank hand-off.
+
+        With raw layerwise DMA, a completed load is already ordered after the
+        preceding save for its bank by the bank FIFO stream.  Join only that
+        load completion on the compute stream.  The old dense-direct fallback
+        retains its save fence because it has no bank FIFO stream; the raw DMA
+        path never joins a store event here.
+        """
+        _, generations, save_done, load_done = (
+            self._layerwise_prefill_transfer_state()
+        )
+        generation = generations.setdefault(int(kv_group), 0)
+        current_stream = torch.npu.current_stream()
+        bank = self._layerwise_prefill_bank(layer_id, kv_group)
+        bank_streams = getattr(self, "_layerwise_prefill_dma_streams", {})
+        bank_fifo_active = (int(kv_group), bank) in bank_streams
+        save_record = save_done.get((kv_group, bank, int(layer_id)))
+        diagnose_first_bank = prefill_start_timing_enabled() and layer_id == 0
+        if diagnose_first_bank:
+            wait_started = time.perf_counter()
+            device_wait_start = torch.npu.Event(enable_timing=True)
+            device_wait_end = torch.npu.Event(enable_timing=True)
+            device_wait_start.record(current_stream)
+        load_record = load_done.pop((kv_group, int(layer_id)), None)
+        if load_record is not None and load_record[0] == generation:
+            # The bank FIFO stream already orders this H2D after the preceding
+            # same-bank D2H. The compute stream only needs this layer's H2D
+            # completion event.
+            current_stream.wait_event(load_record[1])
+        elif (
+            not bank_fifo_active
+            and save_record is not None
+            and save_record[0] == generation
+        ):
+            # Preserve the legacy dense-direct fallback when the raw DMA bank
+            # FIFO is not active. The raw DMA path never takes this branch.
+            current_stream.wait_event(save_record[1])
+        if diagnose_first_bank:
+            device_wait_end.record(current_stream)
+            fields = dict(
+                kv_group=kv_group, layer_id=layer_id, bank=bank,
+                load_event_pending=(
+                    load_record is not None
+                    and load_record[0] == generation
+                    and not load_record[1].query()
+                ),
+                save_event=(
+                    not bank_fifo_active
+                    and save_record is not None
+                    and save_record[0] == generation
+                ),
+                load_event=load_record is not None
+                and load_record[0] == generation,
+            )
+            pending = getattr(self, "_prefill_first_bank_timing_events", None)
+            if pending is None:
+                pending = []
+                self._prefill_first_bank_timing_events = pending
+            pending.append((device_wait_start, device_wait_end, fields))
+            prefill_start_timing_log(
+                logger, "first_bank_wait_enqueue", wait_started, **fields,
+            )
 
 def _prefill_dma_plans(
     block_ids_by_bank: Sequence[Sequence[int]],
