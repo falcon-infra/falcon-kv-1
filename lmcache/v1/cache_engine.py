@@ -1117,6 +1117,12 @@ class LMCacheEngine:
         kv_group: int,
         num_tokens: int,
     ) -> int:
+        policy = getattr(self.metadata, "indexer_c8_layout", None)
+        if kv_group == 1 and policy is not None and policy.mixed:
+            return max(
+                policy.layer_bytes(num_tokens, i)
+                for i in range(self.num_layers_for_group(kv_group))
+            )
         shape: Optional[torch.Size] = None
         if kv_group != 0:
             shape = self._metadata_shape_for_kv_group(kv_group, num_tokens)
@@ -1146,13 +1152,10 @@ class LMCacheEngine:
                 )
 
         dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
-        return (
-            self._shape_numel_without_layer_dim(
-                shape,
-                self.num_layers_for_group(kv_group),
-            )
-            * dtype.itemsize
-        )
+        return self._shape_numel_without_layer_dim(
+            shape,
+            self.num_layers_for_group(kv_group),
+        ) * dtype.itemsize
 
     def _common_expected_shared_cpu_chunk_metadata(
         self,
@@ -1986,8 +1989,10 @@ class LMCacheEngine:
             page = memory_objs[0][chunk]
             if not isinstance(page, LayerPageMemoryObj):
                 break
-            if page.layer_size is None or page.num_layers != num_layers or any(
-                layer[chunk] is not page for layer in memory_objs
+            if (
+                not page.layer_layout_is_valid()
+                or page.num_layers != num_layers
+                or any(layer[chunk] is not page for layer in memory_objs)
             ):
                 return None
             page_chunks += 1
@@ -1996,7 +2001,7 @@ class LMCacheEngine:
             return None
         physical_sizes = [
             (
-                memory_objs[0][chunk].layer_size
+                memory_objs[0][chunk].layer_size_bytes(0)
                 if chunk < page_chunks
                 else int(memory_objs[0][chunk].meta.phy_size)
             )
@@ -2065,7 +2070,7 @@ class LMCacheEngine:
             batch,
             expected_shm_name=allocator.shm_name,
             expected_producer_rank=self.metadata.first_rank,
-            expected_num_layers=self.num_layers,
+            expected_num_layers=self.num_layers_for_group(kv_group),
             expected_num_chunks=batch.num_chunks,
             expected_chunk_hashes=[
                 chunk_hash_to_int(key.chunk_hash)
@@ -2087,8 +2092,18 @@ class LMCacheEngine:
                         shape=shape,
                         dtype=dtype,
                         fmt=fmt,
-                        cached_positions=range(
-                            starts[chunk_index], ends[chunk_index]
+                        cached_positions=range(starts[chunk_index], ends[chunk_index]),
+                        **(
+                            {
+                                "layer_shapes": self.metadata.indexer_layer_shapes(
+                                    int(ends[chunk_index] - starts[chunk_index])
+                                )
+                            }
+                            if kv_group == 1
+                            and getattr(self.metadata, "indexer_c8_layout", None)
+                            is not None
+                            and self.metadata.indexer_c8_layout.mixed
+                            else {}
                         ),
                     )
                 )
@@ -3461,7 +3476,13 @@ class LMCacheEngine:
         """Estimate one merged all-layer page with alignment applied once."""
         logical_bytes = self._estimate_shared_cpu_bytes_per_layer(
             kv_group, int(num_tokens or self.config.chunk_size)
-        ) * self.num_layers
+        ) * self.num_layers_for_group(kv_group)
+        policy = getattr(self.metadata, "indexer_c8_layout", None)
+        if kv_group == 1 and policy is not None and policy.mixed:
+            logical_bytes = sum(
+                policy.layer_bytes(int(num_tokens or self.config.chunk_size), i)
+                for i in range(self.num_layers_for_group(kv_group))
+            )
         try:
             allocator = getattr(
                 self._shared_local_cpu_backend(), "memory_allocator", None
@@ -5625,12 +5646,6 @@ class LMCacheEngine:
             is not None
         )
         assert_layerwise_gpu_connector(self.gpu_connector)
-        deferred_layerwise_get = bool(
-            kwargs.get("deferred_layerwise_get", False)
-        )
-        if deferred_layerwise_get:
-            kwargs.setdefault("cached_chunk_dev_ptrs", [])
-            kwargs.setdefault("cached_chunk_ptrs_npu", [])
         mem_obj_consumer = None
         to_release: list[MemoryObj] = []
         resolved_layers: list[list[MemoryObj]] = []
@@ -5639,9 +5654,6 @@ class LMCacheEngine:
         compact_batch: Optional[SharedHandleBatch] = None
         passive_pages: list[LayerPageMemoryObj] = []
         passive_page_tuple: tuple[LayerPageMemoryObj, ...] = ()
-        sources_safe_to_release = True
-        prepared_sources: list[Any] = []
-        consumer_failed = False
         perf_enabled = serving_perf_enabled()
         consume_started = view_build_s = consumer_send_s = consumer_finish_s = 0.0
 
@@ -5683,9 +5695,7 @@ class LMCacheEngine:
                             "RemoteFill shared-handle envelope validation failed"
                         ) from exc
                     if envelope.status in ("miss", "skipped"):
-                        if deferred_layerwise_get:
-                            prepared_sources.append(None)
-                        elif layer_id == 0:
+                        if layer_id == 0:
                             yield torch.sum(ret_mask)
                         else:
                             yield None
@@ -5778,6 +5788,7 @@ class LMCacheEngine:
                     expected_shape, expected_dtype, expected_fmt = (
                         self._expected_shared_cpu_chunk_metadata(
                             kv_group=kv_group,
+                            layer_id=layer_id,
                             num_tokens=int(
                                 ends_all[chunk_index] - starts_all[chunk_index]
                             ),
@@ -5827,80 +5838,28 @@ class LMCacheEngine:
                 resolved_layers.append(mem_objs_layer)
                 handles_by_layer.append(layer_handles)
 
-                if deferred_layerwise_get:
-                    prepared_sources.append(
-                        LayerPageSource(
-                            passive_page_tuple,
-                            layer_id,
-                            tuple(mem_objs_layer[page_chunks:]),
-                        )
-                        if passive_pages
-                        else mem_objs_layer
-                    )
-                    continue
-
                 if layer_id == 0:
-                    layer_request = yield torch.sum(ret_mask)
+                    yield torch.sum(ret_mask)
                 else:
-                    layer_request = yield None
+                    yield None
 
                 assert mem_obj_consumer is not None
                 send_started = serving_perf_now() if perf_enabled else 0.0
-                try:
-                    memory_objs_layer = (
-                        LayerPageSource(
-                            passive_page_tuple,
-                            layer_id,
-                            tuple(mem_objs_layer[page_chunks:]),
-                        )
-                        if passive_pages
-                        else mem_objs_layer
+                mem_obj_consumer.send(
+                    LayerPageSource(
+                        passive_page_tuple,
+                        layer_id,
+                        tuple(mem_objs_layer[page_chunks:]),
                     )
-                    mem_obj_consumer.send(
-                        memory_objs_layer
-                        if layer_request is None
-                        else {
-                            "memory_objs": memory_objs_layer,
-                            "layer_request": layer_request,
-                        }
-                    )
-                except BaseException:
-                    consumer_failed = deferred_layerwise_get
-                    raise
+                    if passive_pages
+                    else mem_objs_layer
+                )
                 if send_started:
                     consumer_send_s += serving_perf_now() - send_started
 
-            if deferred_layerwise_get:
-                if resolved_layers:
-                    # A skipped group has no consumer. Preserve that protocol;
-                    # ordinary P prefix loads prepare every layer here.
-                    if all(source is not None for source in prepared_sources):
-                        self._prepare_shared_prefill_sources(
-                            prepared_sources, kv_group, kwargs
-                        )
-                    sources_safe_to_release = False
-                try:
-                    consumer_send_s = yield from (
-                        self._submit_prepared_shared_prefill_layers(
-                            mem_obj_consumer, prepared_sources, ret_mask, perf_enabled
-                        )
-                    )
-                except Exception:
-                    consumer_failed = True
-                    raise
-            deferred_cleanup_gate_used = bool(
-                deferred_layerwise_get and mem_obj_consumer is not None
-            )
-            if deferred_cleanup_gate_used:
-                yield None
             if mem_obj_consumer is not None:
                 finish_started = serving_perf_now() if perf_enabled else 0.0
-                try:
-                    next(mem_obj_consumer)
-                except BaseException:
-                    consumer_failed = deferred_layerwise_get
-                    raise
-                sources_safe_to_release = True
+                next(mem_obj_consumer)
                 self._close_shared_retrieve_consumer(mem_obj_consumer)
                 mem_obj_consumer = None
                 if finish_started:
@@ -5955,30 +5914,20 @@ class LMCacheEngine:
                         3,
                     ),
                 )
-            if not deferred_cleanup_gate_used:
-                yield None
+            yield None
             # Keep request-owned shared objects through the final layer wait,
             # but release them before the result yield can remain suspended.
             self._release_shared_retrieve_objs(to_release, unpin=False)
             yield ret_mask
         finally:
             try:
-                if mem_obj_consumer is not None:
-                    self._close_shared_retrieve_consumer(mem_obj_consumer)
-                    if not consumer_failed:
-                        sources_safe_to_release = True
+                self._close_shared_retrieve_consumer(mem_obj_consumer)
             finally:
-                if sources_safe_to_release:
-                    self._release_retained_dense_retrieve_objs(
-                        to_release,
-                        unpin=False,
-                        kwargs=kwargs,
-                    )
-                else:
-                    self._retain_unsafe_layerwise_retrieve_objs(
-                        to_release,
-                        context="Shared CPU passive retrieve",
-                    )
+                self._release_retained_dense_retrieve_objs(
+                    to_release,
+                    unpin=False,
+                    kwargs=kwargs,
+                )
 
     def skip_shared_layerwise_retrieve(
         self,
@@ -13311,53 +13260,38 @@ class LMCacheEngine:
         *,
         kv_group: int,
         num_tokens: int,
-    ):
-        """Use Ascend's group-aware connector shape for shared view checks.
-
-        DSA index chunks are allocated with ``gpu_connector.get_shape(...,
-        kv_group=1)``.  Once vLLM has registered both cache groups, its
-        ``KVLayerGroupsManager`` is the authoritative startup description.
-        Prefer it here because the NPU connector's per-group layout is lazy:
-        querying ``get_shape`` before the first model input can otherwise
-        mirror the wrong active group and reject a valid decoder layout.
-
-        Generic LMCache metadata can still describe only the latent group in
-        older startup/passive paths, so retain the connector fallback.
-        """
-        layer_groups = getattr(
-            self.metadata.kv_layer_groups_manager,
-            "kv_layer_groups",
-            (),
-        )
-        if (
-            self.metadata.use_mla
-            and getattr(self, "dsa_two_groups", False)
-            and 0 <= kv_group < len(layer_groups)
-        ):
-            layer_group = layer_groups[kv_group]
+        layer_id: int = 0,
+    ) -> tuple[torch.Size, torch.dtype, MemoryFormat]:
+        policy = getattr(self.metadata, "indexer_c8_layout", None)
+        if kv_group == 1 and policy is not None and policy.mixed:
             return (
-                torch.Size([num_tokens * layer_group.hidden_dim_size]),
-                layer_group.dtype,
+                torch.Size([policy.layer_bytes(num_tokens, layer_id)]),
+                torch.uint8,
                 self._memory_format_for_kv_group(kv_group),
             )
-
+        shape: Optional[torch.Size] = None
+        if kv_group != 0:
+            shape = self._metadata_shape_for_kv_group(kv_group, num_tokens)
         get_shape = getattr(self.gpu_connector, "get_shape", None)
-        shape = None
-        if callable(get_shape):
+        if shape is None and callable(get_shape):
             try:
                 shape = torch.Size(get_shape(num_tokens, kv_group=kv_group))
             except TypeError:
                 if kv_group == 0:
                     shape = torch.Size(get_shape(num_tokens))
-        if shape is not None:
-            return (
-                shape,
-                self._shared_cpu_dtype_for_kv_group(kv_group),
-                self._memory_format_for_kv_group(kv_group),
-            )
-        return self._common_expected_shared_cpu_chunk_metadata(
-            kv_group=kv_group,
-            num_tokens=num_tokens,
+        if shape is None:
+            shape = self._metadata_shape_for_kv_group(kv_group, num_tokens)
+            if shape is None:
+                raise ValueError(
+                    "KV group shape metadata is unavailable for shared CPU "
+                    "chunk metadata: "
+                    f"kv_group={kv_group}, "
+                    f"num_shapes={len(self.metadata.get_shapes(num_tokens))}"
+                )
+        return (
+            shape,
+            self._shared_cpu_dtype_for_kv_group(kv_group),
+            self._memory_format_for_kv_group(kv_group),
         )
 
     def _resolve_local_cpu_retrieve_location(
