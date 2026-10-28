@@ -2400,6 +2400,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         sparse_dsa_hidden_dims: int,
         source_signature: Optional[tuple] = None,
         return_key: bool = False,
+        require_prepared: bool = False,
     ):
         if kvcaches_ref is None:
             return (None, None) if return_key else None
@@ -2412,7 +2413,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
 
         if total_tokens <= 0:
             total_tokens = self._sparse_total_tokens_from_layer_chunks(
-                layer_tensors, kv_group, layer_id
+                layer_tensors, kv_group
             )
 
         state_key = self._sparse_direct_state_key(
@@ -2434,6 +2435,13 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         state = self._sparse_direct_layer_states.get(state_key)
         if state is not None:
             return (state, state_key) if return_key else state
+
+        if require_prepared:
+            raise RuntimeError(
+                "Ascend dense-direct layer state was not prepared before the "
+                "layerwise-prefill transfer window: "
+                f"kv_group={kv_group}, layer={layer_id}"
+            )
 
         state = prepare_sparse_direct_layer_state(
             layer_tensors[0],
@@ -4693,25 +4701,6 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         device: Optional[torch.device] = None,
         layout_hints: Optional[LayoutHints] = None,
     ) -> "VLLMPagedMemLayerwiseNPUConnector":
-        if getattr(metadata, "indexer_c8_layout", None) is not None and not all(
-            hasattr(lmc_ops, name)
-            for name in (
-                "IndexerC8State",
-                "IndexerC8GroupState",
-                "indexer_c8_transfer_prepared",
-                "indexer_c8_group_transfer_prepared",
-            )
-        ):
-            raise RuntimeError(
-                "Indexer C8 requires rebuilding the LMCache-Ascend native extension"
-            )
-        if (
-            getattr(metadata, "indexer_hbm_block_map", None) is not None
-            and getattr(lmc_ops, "INDEXER_C8_BLOCK_MAP_ABI", 0) < 1
-        ):
-            raise RuntimeError(
-                "Paired-bank C8 requires rebuilding the LMCache-Ascend native extension"
-            )
         num_layers = metadata.kv_shape[0]
         chunk_size = metadata.kv_shape[2]
         num_kv_head = metadata.kv_shape[3]
@@ -4728,8 +4717,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             use_mla=metadata.use_mla,
             layout_hints=layout_hints,
             max_staging_tokens=max_staging_tokens,
-            indexer_c8_layout=getattr(metadata, "indexer_c8_layout", None),
-            indexer_hbm_block_map=getattr(metadata, "indexer_hbm_block_map", None),
+            worker_id=metadata.worker_id,
         )
 
     def _assign_group_gpu_allocator(
@@ -8092,6 +8080,88 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             self._layerwise_prefill_dma_stream(kv_group, bank).wait_event(event)
             uses[(kv_group, bank)] = (generation, layer_id, event)
 
+    def _flush_prefill_first_bank_timing_events(self) -> None:
+        """Read completed diagnostic events without introducing a new fence."""
+        pending = getattr(self, "_prefill_first_bank_timing_events", None)
+        if not pending:
+            return
+        remaining = []
+        for start_event, end_event, fields in pending:
+            if not end_event.query():
+                remaining.append((start_event, end_event, fields))
+                continue
+            device_ms = round(start_event.elapsed_time(end_event), 3)
+            prefill_start_timing_log(
+                logger, "first_bank_wait_device", time.perf_counter(),
+                elapsed_ms=device_ms, device_wait_ms=device_ms,
+                scope="device_event", **fields,
+            )
+        self._prefill_first_bank_timing_events = remaining
+
+    def _synchronize_layerwise_prefill_dma_streams(
+        self,
+        kv_group: Optional[int] = None,
+    ) -> None:
+        """Fence bank FIFO streams at cleanup/publication boundaries only."""
+        streams = getattr(self, "_layerwise_prefill_dma_streams", {})
+        selected = (
+            stream
+            for (group, _bank), stream in streams.items()
+            if kv_group is None or group == int(kv_group)
+        )
+        seen: set[int] = set()
+        for stream in selected:
+            identity = id(stream)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            stream.synchronize()
+
+    def _layerwise_prefill_dma_stream(
+        self,
+        kv_group: int,
+        bank: int,
+    ) -> Any:
+        """Return the FIFO stream for one layerwise-prefill physical bank."""
+        key = (int(kv_group), int(bank))
+        streams = getattr(self, "_layerwise_prefill_dma_streams", None)
+        if streams is None:
+            streams = {}
+            self._layerwise_prefill_dma_streams = streams
+        stream = streams.get(key)
+        if stream is not None:
+            return stream
+
+        # The production NPU runtime exposes torch.npu.Stream.  Keep the
+        # load stream fallback for lightweight CPU/unit-test doubles that do
+        # not expose a Stream factory; it is never selected on an NPU worker.
+        npu = getattr(torch, "npu", None)
+        stream_factory = getattr(npu, "Stream", None)
+        stream = stream_factory() if callable(stream_factory) else self.load_stream
+        streams[key] = stream
+        return stream
+
+    def _check_layerwise_prefill_transfer_generation(
+        self,
+        kv_group: int,
+        generation: int,
+    ) -> None:
+        current = self._layerwise_prefill_transfer_generation(kv_group)
+        if generation != current:
+            raise RuntimeError(
+                "Layerwise-prefill transfer belongs to a reset step: "
+                f"kv_group={kv_group}, transfer_generation={generation}, "
+                f"current_generation={current}"
+            )
+
+    def _layerwise_prefill_transfer_generation(self, kv_group: int) -> int:
+        _, generations, _, _ = self._layerwise_prefill_transfer_state()
+        return generations.setdefault(int(kv_group), 0)
+
+    def supports_layerwise_prefill_transfer_window(self) -> bool:
+        """Whether the connector can honor the two-bank transfer protocol."""
+        return not (_DENSE_DIRECT_LOAD_DISABLE or _DENSE_DIRECT_STORE_DISABLE)
+
 def _prefill_dma_plans(
     block_ids_by_bank: Sequence[Sequence[int]],
     block_size: int,
@@ -8263,325 +8333,3 @@ def _layer_memory_host_ptr(memory_obj: MemoryObj, layer_id: int) -> int:
         return int(data_ptr())
     tensor = _layer_memory_tensor(memory_obj, layer_id)
     return int(tensor.data_ptr())
-
-    def release_sparse_chunk_ptr_cache(
-        self,
-        cached_chunk_ptrs_npu: Optional[List[Optional[torch.Tensor]]],
-    ) -> None:
-        """Release request-local amortized pointer-table backing storage."""
-        if cached_chunk_ptrs_npu is None:
-            return
-        tables = getattr(self, "_layerwise_pointer_tables", None)
-        if not tables:
-            return
-        identity = id(cached_chunk_ptrs_npu)
-        for key in tuple(tables):
-            key_identity = key[0] if isinstance(key, tuple) else key
-            if key_identity == identity:
-                tables.pop(key, None)
-
-    def wait_for_layerwise_prefill_load(
-        self,
-        layer_id: int,
-        kv_group: int,
-    ) -> None:
-        """Order a layer consumer after its asynchronous P-node bank hand-off.
-
-        With raw layerwise DMA, a completed load is already ordered after the
-        preceding save for its bank by the bank FIFO stream.  Join only that
-        load completion on the compute stream.  The old dense-direct fallback
-        retains its save fence because it has no bank FIFO stream; the raw DMA
-        path never joins a store event here.
-        """
-        _, generations, save_done, load_done = (
-            self._layerwise_prefill_transfer_state()
-        )
-        generation = generations.setdefault(int(kv_group), 0)
-        current_stream = torch.npu.current_stream()
-        bank = self._layerwise_prefill_bank(layer_id, kv_group)
-        bank_streams = getattr(self, "_layerwise_prefill_dma_streams", {})
-        bank_fifo_active = (int(kv_group), bank) in bank_streams
-        save_record = save_done.get((kv_group, bank, int(layer_id)))
-        diagnose_first_bank = prefill_start_timing_enabled() and layer_id == 0
-        if diagnose_first_bank:
-            wait_started = time.perf_counter()
-            device_wait_start = torch.npu.Event(enable_timing=True)
-            device_wait_end = torch.npu.Event(enable_timing=True)
-            device_wait_start.record(current_stream)
-        load_record = load_done.pop((kv_group, int(layer_id)), None)
-        if load_record is not None and load_record[0] == generation:
-            # The bank FIFO stream already orders this H2D after the preceding
-            # same-bank D2H. The compute stream only needs this layer's H2D
-            # completion event.
-            current_stream.wait_event(load_record[1])
-        elif (
-            not bank_fifo_active
-            and save_record is not None
-            and save_record[0] == generation
-        ):
-            # Preserve the legacy dense-direct fallback when the raw DMA bank
-            # FIFO is not active. The raw DMA path never takes this branch.
-            current_stream.wait_event(save_record[1])
-        if diagnose_first_bank:
-            device_wait_end.record(current_stream)
-            fields = dict(
-                kv_group=kv_group, layer_id=layer_id, bank=bank,
-                save_event=(
-                    not bank_fifo_active
-                    and save_record is not None
-                    and save_record[0] == generation
-                ),
-                load_event=load_record is not None
-                and load_record[0] == generation,
-            )
-            pending = getattr(self, "_prefill_first_bank_timing_events", None)
-            if pending is None:
-                pending = []
-                self._prefill_first_bank_timing_events = pending
-            pending.append((device_wait_start, device_wait_end, fields))
-            prefill_start_timing_log(
-                logger, "first_bank_wait_enqueue", wait_started, **fields,
-            )
-
-    def _flush_prefill_first_bank_timing_events(self) -> None:
-        """Read completed diagnostic events without introducing a new fence."""
-        pending = getattr(self, "_prefill_first_bank_timing_events", None)
-        if not pending:
-            return
-        remaining = []
-        for start_event, end_event, fields in pending:
-            if not end_event.query():
-                remaining.append((start_event, end_event, fields))
-                continue
-            device_ms = round(start_event.elapsed_time(end_event), 3)
-            prefill_start_timing_log(
-                logger, "first_bank_wait_device", time.perf_counter(),
-                elapsed_ms=device_ms, device_wait_ms=device_ms,
-                scope="device_event", **fields,
-            )
-        self._prefill_first_bank_timing_events = remaining
-
-    def _synchronize_layerwise_prefill_dma_streams(
-        self,
-        kv_group: Optional[int] = None,
-    ) -> None:
-        """Fence bank FIFO streams at cleanup/publication boundaries only."""
-        streams = getattr(self, "_layerwise_prefill_dma_streams", {})
-        selected = (
-            stream
-            for (group, _bank), stream in streams.items()
-            if kv_group is None or group == int(kv_group)
-        )
-        seen: set[int] = set()
-        for stream in selected:
-            identity = id(stream)
-            if identity in seen:
-                continue
-            seen.add(identity)
-            stream.synchronize()
-
-    def _layerwise_prefill_dma_stream(
-        self,
-        kv_group: int,
-        bank: int,
-    ) -> Any:
-        """Return the FIFO stream for one layerwise-prefill physical bank."""
-        key = (int(kv_group), int(bank))
-        streams = getattr(self, "_layerwise_prefill_dma_streams", None)
-        if streams is None:
-            streams = {}
-            self._layerwise_prefill_dma_streams = streams
-        stream = streams.get(key)
-        if stream is not None:
-            return stream
-
-        # The production NPU runtime exposes torch.npu.Stream.  Keep the
-        # load stream fallback for lightweight CPU/unit-test doubles that do
-        # not expose a Stream factory; it is never selected on an NPU worker.
-        npu = getattr(torch, "npu", None)
-        stream_factory = getattr(npu, "Stream", None)
-        stream = stream_factory() if callable(stream_factory) else self.load_stream
-        streams[key] = stream
-        return stream
-
-    def _layerwise_prefill_bank(self, layer_id: int, kv_group: int) -> int:
-        bank_counts, _, _, _ = self._layerwise_prefill_transfer_state()
-        bank_count = bank_counts.get(kv_group, 2)
-        return int(layer_id) % bank_count
-
-    def _set_layerwise_prefill_bank_count(
-        self,
-        kv_group: int,
-        bank_count: int,
-    ) -> None:
-        if bank_count <= 0:
-            raise ValueError("layerwise_prefill_bank_count must be positive")
-        bank_counts, _, save_done, load_done = (
-            self._layerwise_prefill_transfer_state()
-        )
-        previous = bank_counts.get(kv_group)
-        if previous is not None and previous != bank_count:
-            if any(group == kv_group for group, *_ in save_done) or any(
-                group == kv_group for group, _ in load_done
-            ):
-                raise RuntimeError(
-                    "Cannot change layerwise-prefill bank count while transfer "
-                    f"events are live: kv_group={kv_group}, previous={previous}, "
-                    f"requested={bank_count}"
-                )
-        bank_counts[kv_group] = bank_count
-
-    def reset_layerwise_prefill_transfer_state(
-        self,
-        kv_group: Optional[int] = None,
-        *,
-        synchronize: bool = True,
-    ) -> None:
-        """Invalidate layerwise-prefill events at a request/step boundary.
-
-        Abort and cancellation callers should keep ``synchronize=True`` so
-        already submitted H2D/D2H work is complete before its banks or host
-        buffers are reused.  A normal step boundary may pass ``False`` only
-        after the regular load/store drains have completed.
-        """
-        if synchronize:
-            self.load_stream.synchronize()
-            self.store_stream.synchronize()
-            self._synchronize_layerwise_prefill_dma_streams(kv_group)
-        # An aborted/restarted transfer can reuse the request ID with new
-        # pages or block mappings. Never carry bound addresses across reset.
-        getattr(self, "_prefill_dma_bound_loads", {}).clear()
-        getattr(self, "_prefill_dma_slot_snapshots", {}).clear()
-
-        bank_counts, generations, save_done, load_done = (
-            self._layerwise_prefill_transfer_state()
-        )
-        if kv_group is None:
-            groups = set(bank_counts) | set(generations)
-            groups.update(group for group, *_ in save_done)
-            groups.update(group for group, _ in load_done)
-        else:
-            groups = {int(kv_group)}
-
-        for group in groups:
-            generations[group] = generations.get(group, 0) + 1
-        save_done_keys = [key for key in save_done if key[0] in groups]
-        load_done_keys = [key for key in load_done if key[0] in groups]
-        for key in save_done_keys:
-            del save_done[key]
-        for key in load_done_keys:
-            del load_done[key]
-
-    def _check_layerwise_prefill_transfer_generation(
-        self,
-        kv_group: int,
-        generation: int,
-    ) -> None:
-        current = self._layerwise_prefill_transfer_generation(kv_group)
-        if generation != current:
-            raise RuntimeError(
-                "Layerwise-prefill transfer belongs to a reset step: "
-                f"kv_group={kv_group}, transfer_generation={generation}, "
-                f"current_generation={current}"
-            )
-
-    def _layerwise_prefill_transfer_generation(self, kv_group: int) -> int:
-        _, generations, _, _ = self._layerwise_prefill_transfer_state()
-        return generations.setdefault(int(kv_group), 0)
-
-    def _layerwise_prefill_transfer_state(
-        self,
-    ) -> tuple[
-        dict[int, int],
-        dict[int, int],
-        dict[tuple[int, int, int], tuple[int, Any]],
-        dict[tuple[int, int], tuple[int, Any]],
-    ]:
-        """Return lazily initialized state used by P-node bank hand-offs.
-
-        ``save_done`` is keyed by ``(kv_group, bank, layer_id)`` for
-        publication and teardown.  Raw layerwise-prefill DMA uses the
-        per-bank FIFO streams above, so a bank's save/load ordering is carried
-        by stream order; consumers wait only for their layer's load event.
-        """
-        bank_counts = getattr(self, "_layerwise_prefill_bank_counts", None)
-        if bank_counts is None:
-            bank_counts = {}
-            self._layerwise_prefill_bank_counts = bank_counts
-        generations = getattr(
-            self,
-            "_layerwise_prefill_transfer_generations",
-            None,
-        )
-        if generations is None:
-            generations = {}
-            self._layerwise_prefill_transfer_generations = generations
-        save_done = getattr(self, "_layerwise_prefill_save_done_events", None)
-        if save_done is None:
-            save_done = {}
-            self._layerwise_prefill_save_done_events = save_done
-        load_done = getattr(self, "_layerwise_prefill_load_done_events", None)
-        if load_done is None:
-            load_done = {}
-            self._layerwise_prefill_load_done_events = load_done
-        return bank_counts, generations, save_done, load_done
-
-    def layerwise_prefill_store_fences(self, kv_group: int) -> tuple[Any, ...]:
-        """Borrow the current generation's actual per-layer D2H events.
-
-        Call only after draining batched_from_gpu for the entire KV group.
-        Events were already recorded on the per-bank DMA streams; this creates
-        no new event and performs no device synchronization. Empty means
-        unavailable.
-        """
-        generations = getattr(self, "_layerwise_prefill_transfer_generations", {})
-        generation = generations.get(kv_group)
-        if generation is None:
-            return ()
-        save_done = getattr(self, "_layerwise_prefill_save_done_events", {})
-        current = [
-            (layer, event)
-            for (group, _bank, layer), (epoch, event) in save_done.items()
-            if group == kv_group and epoch == generation
-        ]
-        current.sort(key=lambda item: item[0])
-        return tuple(event for _, event in current)
-
-    def release_layerwise_prefill_dma_cache(self, req_id: str) -> None:
-        """Discard one finished request's historical H2D address bindings."""
-        pending_store_events_by_request = getattr(
-            self, "_layerwise_prefill_async_store_events", {}
-        )
-        pending_events = pending_store_events_by_request.get(req_id)
-        if pending_events:
-            for completion in pending_events.values():
-                if isinstance(completion, (tuple, list)):
-                    for event in completion:
-                        event.synchronize()
-                else:
-                    completion.synchronize()
-            pending_store_events_by_request.pop(req_id, None)
-        load_events_by_request = getattr(
-            self, "_layerwise_prefill_load_request_events", {}
-        )
-        # Keep the event list registered until every fence succeeds.  If an
-        # event reports an unknown completion, the request-owned MemoryObjs
-        # must remain leased so a retry/abort path cannot recycle them while
-        # a bank DMA may still be reading.
-        load_events = load_events_by_request.get(req_id)
-        if load_events:
-            for event in load_events:
-                event.synchronize()
-            load_events_by_request.pop(req_id, None)
-        load_owners = getattr(self, "_layerwise_prefill_load_owners", {}).get(req_id)
-        if load_owners:
-            self._layerwise_prefill_load_owners.pop(req_id, None)
-            for owner in load_owners.values():
-                if owner.is_valid():
-                    owner.ref_count_down()
-        self._prefill_dma_bound_loads.pop(req_id, None)
-        self._prefill_dma_slot_snapshots.pop(req_id, None)
-
-    def supports_layerwise_prefill_transfer_window(self) -> bool:
-        """Whether the connector can honor the two-bank transfer protocol."""
-        return not (_DENSE_DIRECT_LOAD_DISABLE or _DENSE_DIRECT_STORE_DISABLE)
