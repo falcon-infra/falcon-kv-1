@@ -119,6 +119,7 @@ from lmcache.v1.remote_fill.npu_transport import (
     RemoteFillDecoderLayout,
     build_decoder_layout,
     create_decoder_remote_fill_runtime,
+    remote_fill_tp_independent,
 )
 from lmcache.v1.remote_fill.security import content_digest
 from lmcache.v1.remote_fill_coordinator import (
