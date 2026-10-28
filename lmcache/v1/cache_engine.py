@@ -172,6 +172,8 @@ from lmcache.v1.serving_perf import prefill_reuse_debug_enabled, prefill_reuse_d
 from lmcache.v1.prefill_locations import PrefillLocationPlan
 from lmcache.v1.prefill_metadata import PrefillSequenceView
 from lmcache.v1.prefill_sources import SharedPrefillSources, same_chunk_key
+from copy import deepcopy
+from lmcache.v1.prefill_metadata import PrefillMetadataPlan
 
 if TYPE_CHECKING:
     # First Party
