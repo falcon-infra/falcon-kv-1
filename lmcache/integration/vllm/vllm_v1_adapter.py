@@ -7184,6 +7184,33 @@ class LMCacheConnectorV1Impl:
         readiness: Any = None,
         additional_owners: tuple[Any, ...] = (),
     ) -> None:
+        if (
+            getattr(self, "_prepare_cold_graph_pointers", False)
+            and readiness is None
+            and not state.dense_prefix_resident_tokens
+        ):
+            source = state.prepared_sparse_sources.get(0)
+            caches = self._kvcaches_for_group(0)
+            if (
+                source is not None
+                and caches
+                and isinstance(caches[0], (tuple, list))
+                and len(caches[0]) == 2
+                and caches[0][0].ndim == 4
+            ):
+                from lmcache.v1.npu_connector.sparse_graph import (
+                    prepare_source_pointer_pairs,
+                )
+
+                key = caches[0][0]
+                with torch.npu.stream(
+                    self.lmcache_engine.gpu_connector.load_stream
+                ):
+                    prepare_source_pointer_pairs(
+                        source,
+                        self._lmcache_chunk_size,
+                        key.shape[-2] * key.shape[-1] * key.element_size(),
+                    )
         assert self.lmcache_engine is not None
         connector = self.lmcache_engine.gpu_connector
         record = getattr(connector, "record_dense_load_readiness", None)
@@ -12938,6 +12965,9 @@ class LMCacheConnectorV1Impl:
         ):
             raise ValueError("Layerwise storing is not supported with async store")
         logger.debug("store_async: %s", self.store_async)
+        self._prepare_cold_graph_pointers = bool(
+            int(os.getenv("VLLM_ASCEND_SFA_FULL_GRAPH", "0"))
+        )
         # Cache the existing dense-load compatibility switches on scheduler and
         # worker alike. Legacy staged copies cannot export async readiness.
         self._resident_cold_load_enabled = not any(
