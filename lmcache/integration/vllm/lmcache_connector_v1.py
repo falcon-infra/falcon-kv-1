@@ -492,3 +492,23 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
     @property
     def supports_layerwise_prefill_transfer_window(self) -> bool:
         return self._lmcache_engine.supports_layerwise_prefill_transfer_window
+
+    @property
+    def supports_layerwise_prefill_bank_events(self) -> bool:
+        """Whether this connector can fence P-node bank reuse."""
+        return callable(
+            getattr(
+                self._lmcache_engine,
+                "record_layerwise_prefill_bank_use",
+                None,
+            )
+        )
+
+    def record_layerwise_prefill_bank_use(self, layer_name: str, event: Any) -> None:
+        """Hand off the event recorded after a P layer's final KV access.
+
+        Args:
+            layer_name: Registered latent or indexer layer name.
+            event: Device event marking the layer's final bank access.
+        """
+        self._lmcache_engine.record_layerwise_prefill_bank_use(layer_name, event)
