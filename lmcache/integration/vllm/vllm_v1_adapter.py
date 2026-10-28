@@ -15848,8 +15848,12 @@ class LMCacheConnectorV1Impl:
         shared_cpu = config.get_extra_config_value(
             "enable_shared_cpu_cache", config.enable_shared_cpu_cache
         )
-        if getattr(config, "decode_checkpoint_writeback", False):
-            from lmcache.v1.mooncake_layout import mooncake_page_layout_enabled
+        standalone = config.pd_role is None
+        if standalone or getattr(config, "decode_checkpoint_writeback", False):
+            from lmcache.v1.mooncake_layout import (
+                mooncake_layer_pages_enabled,
+                mooncake_page_layout_enabled,
+            )
             from lmcache.v1.storage_backend.connector.base_connector import (
                 resolve_save_chunk_meta,
             )
@@ -15857,13 +15861,25 @@ class LMCacheConnectorV1Impl:
                 not str(config.remote_url).startswith("mooncakestore://")
                 or not mooncake_page_layout_enabled(config)
                 or resolve_save_chunk_meta(config)
+                or (standalone and not mooncake_layer_pages_enabled(config))
             ):
                 raise ValueError(
-                    "Checkpoint write-back requires the Mooncake page-first backend"
+                    "Checkpoint write-back/standalone restore requires the Mooncake "
+                    "page-first backend; standalone also requires shared merged pages"
                 )
+        load_mode_supported = (
+            config.dsa_group1_load_mode
+            in (
+                "p2p_preferred",
+                "persistent_serial",
+                "persistent_parallel_prefetch",
+            )
+            if standalone
+            else config.dsa_group1_load_mode == "persistent_direct_hbm"
+        )
         if not (
             self.kv_role == "kv_both"
-            and config.pd_role == "receiver"
+            and config.pd_role in (None, "receiver")
             and config.store_async
             and config.use_layerwise
             and shared_cpu
@@ -15872,7 +15888,7 @@ class LMCacheConnectorV1Impl:
             and config.enable_dsa_cold_compact_load
             and config.get_extra_config_value("save_only_first_rank", True)
             and not vllm_config.cache_config.enable_prefix_caching
-            and config.dsa_group1_load_mode == "persistent_direct_hbm"
+            and load_mode_supported
             and parallel.pipeline_parallel_size
             == parallel.prefill_context_parallel_size
             == parallel.decode_context_parallel_size
@@ -15889,8 +15905,9 @@ class LMCacheConnectorV1Impl:
         ):
             raise ValueError(
                 "decode_preemption_checkpoint requires the two-group shared-CPU "
-                "kv_both decoder with async stores, cold-compact persistent_direct_hbm "
-                "loading, PP/PCP/DCP=1 and ordinary or one-token padded MTP decoding"
+                "kv_both server with async stores, cold-compact loading, "
+                "persistent_direct_hbm on a receiver or CPU loading standalone, "
+                "PP/PCP/DCP=1 and ordinary or one-token padded MTP decoding"
             )
         if not callable(
             getattr(type(self._parent), "handle_preemptions_with_metadata", None)
