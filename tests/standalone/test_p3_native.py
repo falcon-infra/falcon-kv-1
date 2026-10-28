@@ -261,6 +261,37 @@ def test_mooncake_connector_borrows_native_transfer_engine() -> None:
     )
 
 
+def test_dsa_index_capability_covers_decode_workers() -> None:
+    ns = functions(
+        "lmcache/integration/vllm/vllm_v1_adapter.py",
+        ["supports_dsa_index_lmcache"],
+    )
+    capability = ns["supports_dsa_index_lmcache"]
+
+    def adapter(
+        *,
+        prefill: bool,
+        sparse: bool = True,
+        two_groups: bool = True,
+        disabled: bool = False,
+    ) -> NS:
+        return NS(
+            _layerwise_prefill_p_node=prefill,
+            enable_sparse_attention=sparse,
+            _is_dsa_two_groups=lambda: two_groups,
+            _dsa_index_lmcache_disabled=disabled,
+        )
+
+    # Both P and D workers must advertise the index group. Otherwise the
+    # runner drops the one-tensor BF16 owners from a mixed C8 indexer group
+    # while the registered policy still covers the whole group.
+    assert capability(adapter(prefill=False)) is True
+    assert capability(adapter(prefill=True)) is True
+    assert capability(adapter(prefill=False, sparse=False)) is False
+    assert capability(adapter(prefill=False, two_groups=False)) is False
+    assert capability(adapter(prefill=False, disabled=True)) is False
+
+
 def test_registered_buffer_copies_keep_nonblocking_semantics() -> None:
     ns = functions(
         "lmcache/v1/device_connector/memory_ops.py",

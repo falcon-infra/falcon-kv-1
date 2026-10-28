@@ -361,7 +361,6 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         # completion bookkeeping is keyed by the primary group's block table.
         return self.request_finished(request, block_ids[0])
 
-    supports_dsa_index_lmcache = True
 
     @property
     def uses_layerwise_model_callbacks(self) -> bool:
@@ -453,3 +452,25 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         engine = getattr(self._lmcache_engine, "lmcache_engine", None)
         check = getattr(engine, "remote_fill_requires_paired_restart", None)
         return bool(check()) if callable(check) else False
+
+    def finish_layerwise_prefill_save(self, layer_name: str) -> None:
+        """Run storage publication after the layer's HCOM is submitted."""
+        self._lmcache_engine.finish_layerwise_prefill_save(layer_name)
+
+    def submit_layerwise_prefill_load(self, layer_name: str | int) -> None:
+        """Submit N+2; virtual N=-1 submits L1 at first-layer entry."""
+        self._lmcache_engine.submit_layerwise_prefill_load(layer_name)
+
+    @property
+    def supports_layerwise_prefill_dsa_index_transfer_window(self) -> bool:
+        return (
+            self._lmcache_engine.supports_layerwise_prefill_dsa_index_transfer_window
+        )
+
+    @property
+    def supports_dsa_index_lmcache(self) -> bool:
+        return self._lmcache_engine.supports_dsa_index_lmcache
+
+    @property
+    def supports_layerwise_prefill_transfer_window(self) -> bool:
+        return self._lmcache_engine.supports_layerwise_prefill_transfer_window
