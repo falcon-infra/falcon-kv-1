@@ -13060,6 +13060,7 @@ class LMCacheConnectorV1Impl:
                 "LMCACHE_ASCEND_DENSE_DIRECT_LOAD_DISABLE",
             )
         )
+        self._defer_prepared_sparse_setup = self._prepare_cold_graph_pointers
 
     def configure_live_latent_source(self, enabled: bool) -> None:
         """Apply the two-sided hybrid-transport capability decision."""
