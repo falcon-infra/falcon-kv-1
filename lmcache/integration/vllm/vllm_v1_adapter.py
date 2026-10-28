@@ -7324,6 +7324,15 @@ class LMCacheConnectorV1Impl:
                 mode="dsa_cold_compact",
             )
         executor = self._get_dsa_cold_load_executor()
+        prepare_chunks = getattr(self.lmcache_engine, "prepare_cold_chunk_plan", None)
+        if (
+            callable(prepare_chunks)
+            and request.load_spec.dsa_group1_direct_hbm
+            and not getattr(request.load_spec, "dsa_cold_resident_load", False)
+        ):
+            chunks = prepare_chunks(plan["tokens"])
+            if chunks is not None:
+                plan["chunk_plan"] = chunks
         if perf_enabled:
             executor_submit_started = serving_perf_now()
         coordinator.submit_pair(
@@ -7726,6 +7735,7 @@ class LMCacheConnectorV1Impl:
                 indexer_kvcaches,
                 request.request_configs,
                 request.req_id,
+                **({"chunk_plan": plan["chunk_plan"]} if "chunk_plan" in plan else {}),
             )
             finish_stage("direct_page_load_ms", direct_started)
             if perf_breakdown is not None:
