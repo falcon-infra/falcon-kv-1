@@ -247,6 +247,8 @@ class MooncakestoreConnector(RemoteConnector):
             )
         self._external_page_only = external_page_only
         self._lmcache_metadata = engine_metadata
+        indexer_layout = getattr(engine_metadata, "indexer_c8_layout", None)
+        self._mixed_indexer_layout = indexer_layout if indexer_layout is not None and indexer_layout.mixed else None
 
         # initialize base class, which includes some common attributes
         super().__init__(engine_config, engine_metadata)

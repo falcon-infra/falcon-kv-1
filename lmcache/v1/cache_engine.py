@@ -2003,8 +2003,10 @@ class LMCacheEngine:
             page = memory_objs[0][chunk]
             if not isinstance(page, LayerPageMemoryObj):
                 break
-            if page.num_layers != num_layers or any(
-                layer[chunk] is not page for layer in memory_objs
+            if (
+                not page.layer_layout_is_valid()
+                or page.num_layers != num_layers
+                or any(layer[chunk] is not page for layer in memory_objs)
             ):
                 return None
             page_chunks += 1
@@ -2016,7 +2018,7 @@ class LMCacheEngine:
             previous.physical_sizes[:reuse_chunks] if previous else []
         ) + [
             (
-                memory_objs[0][chunk].layer_size
+                memory_objs[0][chunk].layer_size_bytes(0)
                 if chunk < page_chunks
                 else int(memory_objs[0][chunk].meta.phy_size)
             )
@@ -2132,6 +2134,18 @@ class LMCacheEngine:
                         dtype=dtype,
                         fmt=fmt,
                         cached_positions=range(starts[chunk_index], ends[chunk_index]),
+                        **(
+                            {
+                                "layer_shapes": self.metadata.indexer_layer_shapes(
+                                    int(ends[chunk_index] - starts[chunk_index])
+                                )
+                            }
+                            if kv_group == 1
+                            and getattr(self.metadata, "indexer_c8_layout", None)
+                            is not None
+                            and self.metadata.indexer_c8_layout.mixed
+                            else {}
+                        ),
                         **(
                             {
                                 "previous": self._cached_shared_prefill_source(
@@ -5417,8 +5431,15 @@ class LMCacheEngine:
         if deferred_layerwise_get:
             kwargs.setdefault("cached_chunk_dev_ptrs", [])
             kwargs.setdefault("cached_chunk_ptrs_npu", [])
-        mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
-        next(mem_obj_consumer)
+        prepare_c8_packets = bool(
+            deferred_layerwise_get and kv_group == 1
+            and kwargs.get("prefill_dma_block_ids_by_bank") is not None
+            and getattr(self.metadata, "indexer_c8_layout", None) is not None
+        )
+        mem_obj_consumer = None
+        if not prepare_c8_packets:
+            mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
+            next(mem_obj_consumer)
 
         to_release: list[MemoryObj] = []
         resolved_layers: list[list[MemoryObj]] = []
@@ -5753,6 +5774,11 @@ class LMCacheEngine:
                 self._prepare_shared_prefill_sources(
                     prepared_sources, kv_group, kwargs
                 )
+                if prepare_c8_packets:
+                    mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                        starts, ends, prefill_c8_memory_objs=resolved_layers, **kwargs
+                    )
+                    next(mem_obj_consumer)
                 sources_safe_to_release = False
                 if perf_enabled:
                     consume_started = serving_perf_now()
@@ -5923,6 +5949,11 @@ class LMCacheEngine:
             kwargs.get("deferred_layerwise_get", False)
         )
         prefill_timing = deferred_layerwise_get and prefill_start_timing_enabled()
+        prepare_c8_packets = bool(
+            deferred_layerwise_get and kv_group == 1
+            and kwargs.get("prefill_dma_block_ids_by_bank") is not None
+            and getattr(self.metadata, "indexer_c8_layout", None) is not None
+        )
         if deferred_layerwise_get:
             kwargs.setdefault("cached_chunk_dev_ptrs", [])
             kwargs.setdefault("cached_chunk_ptrs_npu", [])
@@ -6017,12 +6048,11 @@ class LMCacheEngine:
                     ends = ends_all[:expected_handle_count]
                     for start, end in zip(starts, ends, strict=False):
                         ret_mask[start:end] = True
-                    mem_obj_consumer = self.gpu_connector.batched_to_gpu(
-                        starts,
-                        ends,
-                        **kwargs,
-                    )
-                    next(mem_obj_consumer)
+                    if not prepare_c8_packets:
+                        mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                            starts, ends, **kwargs
+                        )
+                        next(mem_obj_consumer)
                     if compact_batch is not None:
                         page_view_started = (
                             serving_perf_now() if perf_enabled else 0.0
@@ -6128,6 +6158,7 @@ class LMCacheEngine:
                     expected_shape, expected_dtype, expected_fmt = (
                         self._expected_shared_cpu_chunk_metadata(
                             kv_group=kv_group,
+                            layer_id=layer_id,
                             num_tokens=int(
                                 ends_all[chunk_index] - starts_all[chunk_index]
                             ),
@@ -6254,6 +6285,14 @@ class LMCacheEngine:
                     consumer_send_s += serving_perf_now() - send_started
 
             if deferred_layerwise_get:
+                if prepare_c8_packets and resolved_layers and (
+                    len(resolved_layers) != self.num_layers_for_group(kv_group)
+                    or any(source is None for source in prepared_sources)
+                ):
+                    raise RuntimeError(
+                        "Incomplete shared C8 prefill source group; refusing "
+                        "to report a successful prefix before every owner is resolved"
+                    )
                 if resolved_layers:
                     # A skipped group has no consumer. Preserve that protocol;
                     # ordinary P prefix loads prepare every layer here.
@@ -6262,6 +6301,12 @@ class LMCacheEngine:
                         self._prepare_shared_prefill_sources(
                             prepared_sources, kv_group, kwargs
                         )
+                        if prepare_c8_packets:
+                            mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                                starts, ends,
+                                prefill_c8_memory_objs=resolved_layers, **kwargs
+                            )
+                            next(mem_obj_consumer)
                         if pointer_started:
                             prefill_start_timing_log(
                                 logger,
@@ -7611,7 +7656,12 @@ class LMCacheEngine:
                     self._maybe_unpin_retrieved_objs(mem_objs, location)
             else:
                 mem_obj_consumer = None
-                sources_safe_to_release = not deferred_layerwise_get
+                prepare_c8_packets = bool(
+                    kv_group == 1
+                    and kwargs.get("prefill_dma_block_ids_by_bank") is not None
+                    and getattr(self.metadata, "indexer_c8_layout", None) is not None
+                )
+                sources_safe_to_release = prepare_c8_packets
                 consumer_failed = False
                 pending_gets: list[tuple[str, Any]] = []
                 to_count_down: list[MemoryObj] = []
@@ -7630,12 +7680,51 @@ class LMCacheEngine:
                     retrieved_by_location.clear()
 
                 try:
+                    prepared_c8_sources = None
+                    if prepare_c8_packets:
+                        # Packet offsets depend on physical page capacity,
+                        # including retained partial tails. Resolve all owners
+                        # before the first forward yield so callbacks only submit.
+                        prepared_c8_sources = []
+                        for layer_id in range(num_layers):
+                            row = []
+                            for segment, get_generator in zip(
+                                segments, get_generators, strict=True
+                            ):
+                                task = next(get_generator)
+                                assert task is not None
+                                pending_get = (segment[0], task)
+                                pending_gets.append(pending_get)
+                                objects = task.result()
+                                to_count_down.extend(objects)
+                                retrieved_by_location[segment[0]].extend(objects)
+                                pending_gets.remove(pending_get)
+                                if len(objects) != len(segment[1]):
+                                    raise RuntimeError(
+                                        "Incomplete C8 prefill source layer: "
+                                        f"req_id={req_id}, layer={layer_id}"
+                                    )
+                                row.extend(objects)
+                            prepared_c8_sources.append(row)
                     mem_obj_consumer = self.gpu_connector.batched_to_gpu(
-                        starts, ends, **kwargs
+                        starts, ends, **kwargs,
+                        **({"prefill_c8_memory_objs": prepared_c8_sources}
+                           if prepared_c8_sources is not None else {}),
                     )
                     next(mem_obj_consumer)
+                    if prepared_c8_sources is not None:
+                        sources_safe_to_release = False
+                        try:
+                            yield from self._submit_prepared_shared_prefill_layers(
+                                mem_obj_consumer, prepared_c8_sources, ret_mask
+                            )
+                        except BaseException:
+                            consumer_failed = True
+                            raise
 
-                    for layer_id in range(num_layers):
+                    for layer_id in range(
+                        0 if prepared_c8_sources is not None else num_layers
+                    ):
                         layer_gets = []
                         for segment, get_generator in zip(
                             segments, get_generators, strict=True
@@ -18779,7 +18868,8 @@ class LMCacheEngine:
                 if not lease.owns(obj):
                     raise ValueError("Shared prefill prefix lost request ownership")
                 shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
-                    kv_group=kv_group, num_tokens=ends[index] - starts[index]
+                    kv_group=kv_group, num_tokens=ends[index] - starts[index],
+                    layer_id=0 if isinstance(obj, LayerPageMemoryObj) else layer_id,
                 )
                 if (obj.get_shape() != shape or obj.get_dtype() != dtype
                         or obj.get_memory_format() != fmt):
@@ -18876,12 +18966,18 @@ class LMCacheEngine:
             allocator = (
                 rank0_context.parent_allocator if rank0_context is not None else None
             )
-        return (
+        context = (
             self.shared_cpu_cache_generation,
             getattr(self, "shared_cpu_cache_name", None),
             id(allocator) if allocator is not None else None,
             self.num_layers_for_group(kv_group), tuple(shape), dtype, fmt,
         )
+        policy = (
+            getattr(self.metadata, "indexer_c8_layout", None) if kv_group == 1 else None
+        )
+        # The trusted prefix skips per-page descriptor validation. Bind its
+        # proof to every owner's packet shape, including equal-size reorderings.
+        return context + (policy,) if policy is not None else context
 
     def _shared_prefill_cached_prefix(
         self, req_id: str, kv_group: int, candidates: Any, kwargs: dict[str, Any]
