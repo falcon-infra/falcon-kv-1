@@ -12609,6 +12609,19 @@ class LMCacheConnectorV1Impl:
                     request_tracker.num_lmcache_cached_tokens
                 )
 
+        if (
+            isinstance(return_params, dict)
+            and isinstance(params, dict)
+            and params.get("do_remote_decode")
+            and isinstance(getattr(request, "num_cached_tokens", None), int)
+            and request.num_cached_tokens >= 0
+        ):
+            # Keep the P-side prefix-cache hit count in the public
+            # do_remote_decode handoff for the D worker.
+            return_params["remote_prefill_cached_tokens"] = (
+                request.num_cached_tokens
+            )
+
         delay_free = bool(getattr(request, "dsa_compact_allocated", False))
         return delay_free and not predispatch_cancelled, return_params
 
@@ -14807,6 +14820,19 @@ class LMCacheConnectorV1Impl:
                 return_params["num_lmcache_cached_tokens"] = (
                     request_tracker.num_lmcache_cached_tokens
                 )
+
+        if (
+            isinstance(return_params, dict)
+            and isinstance(params, dict)
+            and params.get("do_remote_decode")
+            and isinstance(getattr(request, "num_cached_tokens", None), int)
+            and request.num_cached_tokens >= 0
+        ):
+            # Keep the P-side prefix-cache hit count in the public
+            # do_remote_decode handoff for the D worker.
+            return_params["remote_prefill_cached_tokens"] = (
+                request.num_cached_tokens
+            )
 
         delay_free = bool(getattr(request, "dsa_compact_allocated", False))
         return delay_free and not predispatch_cancelled, return_params
