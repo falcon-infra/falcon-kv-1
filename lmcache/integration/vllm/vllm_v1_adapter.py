@@ -1510,6 +1510,7 @@ class ReqMeta:
 
     layerwise_prefill_bank_offset: int = 0
     prefill_metadata_mm_signature: tuple[Any, ...] = ()
+    prefill_overlap_span: Optional[tuple[int, int]] = None
     slot_mappings_by_bank: Optional[list[list[torch.Tensor]]] = None
     block_ids_by_bank: Optional[tuple[tuple[list[int], ...], ...]] = None
     block_allocation_mode: Optional[str] = None
@@ -15753,6 +15754,10 @@ class LMCacheConnectorV1Impl:
         )
         if bank_offset is not None:
             wait_kwargs["bank_offset"] = bank_offset
+        if getattr(self, "_prefill_overlap_step_active", False):
+            wait_kwargs["model_layer_id"] = self._layerwise_layer_id_from_name(
+                layer_name
+            )
         wait(**wait_kwargs)
 
     def _layerwise_prefill_slot_mapping(
