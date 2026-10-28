@@ -6363,6 +6363,16 @@ class LMCacheConnectorV1Impl:
         if require_pointer_cache and not can_append_ptrs:
             return 0
 
+        if pointer_table is not None and (
+            not can_append_ptrs
+            or not pointer_table.matches_rows(dst_chunk_ptrs_npu, existing_chunks)
+        ):
+            # A dense load may have adopted a longer prefix, replaced its
+            # pointers, or deferred them for raw DMA. Invalidate the old store
+            # table before truncation; append rebuilds from the current rows
+            # when available. Keep matching tables for amortized growth.
+            pointer_table.clear()
+
         if replace_at is not None:
             del dst_starts[replace_at:]
             del dst_ends[replace_at:]
