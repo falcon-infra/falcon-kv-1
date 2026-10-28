@@ -1976,6 +1976,8 @@ class LMCacheEngine:
         keys_layer_major: list[list[CacheEngineKey]],
         *,
         kv_group: int = 0,
+        previous: Optional[SharedHandleBatch] = None,
+        reuse_chunks: int = 0,
     ) -> Optional[SharedHandleBatch]:
         """Compact a homogeneous all-layer page-first result."""
         started = serving_perf_now() if serving_perf_enabled() else None
@@ -1994,54 +1996,74 @@ class LMCacheEngine:
             or any(len(layer) != chunks for layer in keys_layer_major)
         ):
             return None
-        page_chunks = 0
-        for chunk in range(chunks):
+        reuse_chunks = min(reuse_chunks, chunks) if previous is not None else 0
+        page_chunks = min(reuse_chunks, len(previous.page_offsets)) if previous else 0
+        for chunk in range(reuse_chunks if page_chunks == reuse_chunks else chunks,
+                           chunks):
             page = memory_objs[0][chunk]
             if not isinstance(page, LayerPageMemoryObj):
                 break
-            if (
-                not page.layer_layout_is_valid()
-                or page.num_layers != num_layers
-                or any(layer[chunk] is not page for layer in memory_objs)
+            if page.num_layers != num_layers or any(
+                layer[chunk] is not page for layer in memory_objs
             ):
                 return None
             page_chunks += 1
-        tail = [obj for layer in memory_objs for obj in layer[page_chunks:]]
+        tail_start = max(page_chunks, reuse_chunks)
+        tail = [obj for layer in memory_objs for obj in layer[tail_start:]]
         if any(type(obj) is not TensorMemoryObj for obj in tail):
             return None
-        physical_sizes = [
+        physical_sizes = (
+            previous.physical_sizes[:reuse_chunks] if previous else []
+        ) + [
             (
-                memory_objs[0][chunk].layer_size_bytes(0)
+                memory_objs[0][chunk].layer_size
                 if chunk < page_chunks
                 else int(memory_objs[0][chunk].meta.phy_size)
             )
-            for chunk in range(chunks)
+            for chunk in range(reuse_chunks, chunks)
         ]
         if any(
             int(obj.meta.phy_size) != physical_sizes[chunk]
             or obj.get_size() > physical_sizes[chunk]
             for layer in memory_objs
-            for chunk, obj in enumerate(layer[page_chunks:], page_chunks)
+            for chunk, obj in enumerate(layer[tail_start:], tail_start)
         ):
             return None
+        offsets: list[int] = []
+        previous_tail = (
+            previous.num_chunks - len(previous.page_offsets) if previous else 0
+        )
+        for layer_id, layer in enumerate(memory_objs):
+            if previous is not None:
+                begin = layer_id * previous_tail
+                offsets.extend(
+                    previous.offsets[
+                        begin : begin + max(0, reuse_chunks - page_chunks)
+                    ]
+                )
+            offsets.extend(int(obj.meta.address) for obj in layer[tail_start:])
         batch = SharedHandleBatch(
             shm_name=self.shared_cpu_cache_name,
             producer_rank=self.metadata.worker_id,
             num_layers=num_layers,
             num_chunks=chunks,
             physical_sizes=physical_sizes,
-            chunk_hashes=[
+            chunk_hashes=(previous.chunk_hashes[:reuse_chunks] if previous else []) + [
                 chunk_hash_to_int(key.chunk_hash)
-                for key in keys_layer_major[0][:chunks]
+                for key in keys_layer_major[0][reuse_chunks:chunks]
             ],
-            offsets=[int(obj.meta.address) for obj in tail],
-            page_offsets=[
+            offsets=offsets,
+            page_offsets=(previous.page_offsets[:min(reuse_chunks, page_chunks)]
+                          if previous else []) + [
                 int(memory_objs[0][chunk].meta.address)
-                for chunk in range(page_chunks)
+                for chunk in range(reuse_chunks, page_chunks)
             ],
-            page_physical_sizes=[
+            page_physical_sizes=(
+                previous.page_physical_sizes[:min(reuse_chunks, page_chunks)]
+                if previous else []
+            ) + [
                 int(memory_objs[0][chunk].meta.phy_size)
-                for chunk in range(page_chunks)
+                for chunk in range(reuse_chunks, page_chunks)
             ],
         )
         if started is not None:
@@ -2065,6 +2087,7 @@ class LMCacheEngine:
         ends: list[int],
         keys_layer_major: list[list[CacheEngineKey]],
         kv_group: int,
+        reuse_kwargs: Optional[dict[str, Any]] = None,
     ) -> tuple[LayerPageMemoryObj, ...]:
         """Validate a compact batch and create its passive layer pages."""
         allocator = self.shared_cpu_cache_passive_allocator
@@ -2089,8 +2112,14 @@ class LMCacheEngine:
             slab_size=allocator.slab_size,
         )
         pages: list[LayerPageMemoryObj] = []
+        page_prefix = min(
+            (reuse_kwargs or {}).get("_shared_prefill_reuse_count", 0),
+            len(batch.page_offsets),
+        )
+        if page_prefix:
+            pages.extend(reuse_kwargs["cached_memory_objs"][0][:page_prefix])
         try:
-            for chunk_index in range(len(batch.page_offsets)):
+            for chunk_index in range(page_prefix, len(batch.page_offsets)):
                 shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
                     kv_group=kv_group,
                     num_tokens=int(ends[chunk_index] - starts[chunk_index]),
@@ -2105,20 +2134,30 @@ class LMCacheEngine:
                         cached_positions=range(starts[chunk_index], ends[chunk_index]),
                         **(
                             {
-                                "layer_shapes": self.metadata.indexer_layer_shapes(
-                                    int(ends[chunk_index] - starts[chunk_index])
+                                "previous": self._cached_shared_prefill_source(
+                                    reuse_kwargs,
+                                    0,
+                                    chunk_index,
+                                    starts[chunk_index],
+                                    ends[chunk_index],
+                                    keys_layer_major[0][chunk_index],
                                 )
                             }
-                            if kv_group == 1
-                            and getattr(self.metadata, "indexer_c8_layout", None)
-                            is not None
-                            and self.metadata.indexer_c8_layout.mixed
+                            if reuse_kwargs is not None
                             else {}
                         ),
                     )
                 )
         except Exception:
-            self._release_shared_retrieve_objs(pages, unpin=False)
+            retained_ids = {
+                id(obj)
+                for row in (reuse_kwargs or {}).get("cached_memory_objs", ())
+                for obj in row
+            }
+            self._release_shared_retrieve_objs(
+                [page for page in pages if id(page) not in retained_ids],
+                unpin=False,
+            )
             raise
         return tuple(pages)
 
@@ -5880,6 +5919,13 @@ class LMCacheEngine:
             is not None
         )
         assert_layerwise_gpu_connector(self.gpu_connector)
+        deferred_layerwise_get = bool(
+            kwargs.get("deferred_layerwise_get", False)
+        )
+        prefill_timing = deferred_layerwise_get and prefill_start_timing_enabled()
+        if deferred_layerwise_get:
+            kwargs.setdefault("cached_chunk_dev_ptrs", [])
+            kwargs.setdefault("cached_chunk_ptrs_npu", [])
         mem_obj_consumer = None
         to_release: list[MemoryObj] = []
         resolved_layers: list[list[MemoryObj]] = []
@@ -5888,13 +5934,28 @@ class LMCacheEngine:
         compact_batch: Optional[SharedHandleBatch] = None
         passive_pages: list[LayerPageMemoryObj] = []
         passive_page_tuple: tuple[LayerPageMemoryObj, ...] = ()
+        sources_safe_to_release = True
+        prepared_sources: list[Any] = []
+        consumer_failed = False
         perf_enabled = serving_perf_enabled()
         consume_started = view_build_s = consumer_send_s = consumer_finish_s = 0.0
+        retained_lease = (
+            self.get_shared_cpu_request_lease(req_id)
+            if kwargs.get("_reuse_shared_dense_prefix") else None
+        )
+        source_state = self._shared_prefill_source_state(req_id, kv_group, kwargs)
+        source_prefix = 0
+        if deferred_layerwise_get and kwargs.get("_reuse_shared_dense_prefix"):
+            kwargs.pop("_shared_prefill_reuse_count", None)
+        debug_stats = kwargs.get(_PREFILL_REUSE_DEBUG_KEY)
 
         try:
             for layer_id in range(self.num_layers_for_group(kv_group)):
                 envelope = None
                 if compact_batch is None:
+                    receive_started = (
+                        time.perf_counter() if debug_stats is not None else 0.0
+                    )
                     envelope = self._receive_matching_shared_envelope(
                         req_id=req_id,
                         phase=phase,
@@ -5902,6 +5963,10 @@ class LMCacheEngine:
                         layer_id=layer_id,
                         kv_group=kv_group,
                     )
+                    if debug_stats is not None:
+                        debug_stats["wait_ms"] += (
+                            time.perf_counter() - receive_started
+                        ) * 1000
                     if perf_enabled and not consume_started:
                         consume_started = serving_perf_now()
                     try:
@@ -5929,13 +5994,17 @@ class LMCacheEngine:
                             "RemoteFill shared-handle envelope validation failed"
                         ) from exc
                     if envelope.status in ("miss", "skipped"):
-                        if layer_id == 0:
+                        if deferred_layerwise_get:
+                            prepared_sources.append(None)
+                        elif layer_id == 0:
                             yield torch.sum(ret_mask)
                         else:
                             yield None
                         continue
                     if envelope.batch is not None:
                         compact_batch = envelope.batch
+                        if debug_stats is not None:
+                            debug_stats["compact"] = 1
 
                 if expected_handle_count is None:
                     assert envelope is not None
@@ -5958,16 +6027,36 @@ class LMCacheEngine:
                         page_view_started = (
                             serving_perf_now() if perf_enabled else 0.0
                         )
+                        if kwargs.get("_reuse_shared_dense_prefix"):
+                            kwargs["_shared_prefill_reuse_count"] = 0
+                        if source_state is not None:
+                            source_prefix = self._shared_prefill_cached_prefix(
+                                req_id, kv_group,
+                                zip(starts, ends, keys_layer_major[0], strict=False),
+                                kwargs,
+                            )
+                            source_prefix = source_state.matching_prefix(
+                                starts, ends, keys_layer_major[0], source_prefix
+                            )
+                            # Full-envelope bounds validation happens below,
+                            # before any borrowed views are submitted to DMA.
+                            source_prefix = source_state.wire_prefix(
+                                compact_batch, source_prefix
+                            )
+                            kwargs["_shared_prefill_reuse_count"] = source_prefix
                         view_error: Exception | None = None
                         try:
-                            passive_page_tuple = (
-                                self._make_passive_layer_page_views(
-                                    compact_batch,
-                                    starts=starts_all,
-                                    ends=ends_all,
-                                    keys_layer_major=keys_layer_major,
-                                    kv_group=kv_group,
-                                )
+                            passive_page_tuple = self._make_passive_layer_page_views(
+                                compact_batch,
+                                starts=starts_all,
+                                ends=ends_all,
+                                keys_layer_major=keys_layer_major,
+                                kv_group=kv_group,
+                                reuse_kwargs=(
+                                    kwargs
+                                    if kwargs.get("_reuse_shared_dense_prefix")
+                                    else None
+                                ),
                             )
                         except Exception as exc:
                             if not remote_fill_load:
@@ -5990,7 +6079,16 @@ class LMCacheEngine:
                                 "materialization failed"
                             ) from view_error
                         passive_pages.extend(passive_page_tuple)
-                        to_release.extend(passive_pages)
+                        reused_pages = min(source_prefix, len(passive_pages))
+                        for page in passive_pages[reused_pages:]:
+                            if retained_lease is None or not retained_lease.owns(page):
+                                to_release.append(page)
+                                if debug_stats is not None:
+                                    debug_stats["page_new"] += 1
+                            elif debug_stats is not None:
+                                debug_stats["page_reuse"] += 1
+                        if debug_stats is not None:
+                            debug_stats["page_reuse"] += reused_pages
                         if page_view_started:
                             view_build_s += serving_perf_now() - page_view_started
                 elif (
@@ -6017,12 +6115,19 @@ class LMCacheEngine:
                 )
                 view_started = serving_perf_now() if perf_enabled else 0.0
                 page_chunks = len(passive_pages)
-                for chunk_index in range(page_chunks, expected_handle_count):
+                if source_prefix > page_chunks:
+                    mem_objs_layer.extend(
+                        kwargs["cached_memory_objs"][layer_id][page_chunks:source_prefix]
+                    )
+                    if debug_stats is not None:
+                        debug_stats["tail_reuse"] += source_prefix - page_chunks
+                for chunk_index in range(
+                    max(page_chunks, source_prefix), expected_handle_count
+                ):
                     handle = layer_handles[chunk_index]
                     expected_shape, expected_dtype, expected_fmt = (
                         self._expected_shared_cpu_chunk_metadata(
                             kv_group=kv_group,
-                            layer_id=layer_id,
                             num_tokens=int(
                                 ends_all[chunk_index] - starts_all[chunk_index]
                             ),
@@ -6042,6 +6147,20 @@ class LMCacheEngine:
                                 dtype=expected_dtype,
                                 fmt=expected_fmt,
                                 cached_positions=positions,
+                                **(
+                                    {
+                                        "previous": self._cached_shared_prefill_source(
+                                            kwargs,
+                                            layer_id,
+                                            chunk_index,
+                                            starts_all[chunk_index],
+                                            ends_all[chunk_index],
+                                            keys_layer_major[layer_id][chunk_index],
+                                        )
+                                    }
+                                    if kwargs.get("_reuse_shared_dense_prefix")
+                                    else {}
+                                ),
                             )
                             if compact_batch is not None
                             else self.shared_cpu_cache_passive_allocator.create_view(
@@ -6057,6 +6176,20 @@ class LMCacheEngine:
                                 expected_fmt=expected_fmt,
                                 expected_cached_positions=positions,
                                 expected_producer_rank=self.metadata.first_rank,
+                                **(
+                                    {
+                                        "previous": self._cached_shared_prefill_source(
+                                            kwargs,
+                                            layer_id,
+                                            chunk_index,
+                                            starts_all[chunk_index],
+                                            ends_all[chunk_index],
+                                            keys_layer_major[layer_id][chunk_index],
+                                        )
+                                    }
+                                    if kwargs.get("_reuse_shared_dense_prefix")
+                                    else {}
+                                ),
                             )
                         )
                     except Exception as exc:
@@ -6066,34 +6199,102 @@ class LMCacheEngine:
                             "RemoteFill passive shared view materialization failed"
                         ) from exc
                     mem_objs_layer.append(mem_obj)
-                    to_release.append(mem_obj)
+                    if retained_lease is None or not retained_lease.owns(mem_obj):
+                        to_release.append(mem_obj)
+                        if debug_stats is not None:
+                            debug_stats["tail_new"] += 1
+                    elif debug_stats is not None:
+                        debug_stats["tail_reuse"] += 1
                 if view_started:
                     view_build_s += serving_perf_now() - view_started
                 resolved_layers.append(mem_objs_layer)
                 handles_by_layer.append(layer_handles)
 
+                if deferred_layerwise_get:
+                    prepared_sources.append(
+                        LayerPageSource(
+                            passive_page_tuple,
+                            layer_id,
+                            tuple(mem_objs_layer[page_chunks:]),
+                        )
+                        if passive_pages
+                        else mem_objs_layer
+                    )
+                    continue
+
                 if layer_id == 0:
-                    yield torch.sum(ret_mask)
+                    layer_request = yield torch.sum(ret_mask)
                 else:
-                    yield None
+                    layer_request = yield None
 
                 assert mem_obj_consumer is not None
                 send_started = serving_perf_now() if perf_enabled else 0.0
-                mem_obj_consumer.send(
-                    LayerPageSource(
-                        passive_page_tuple,
-                        layer_id,
-                        tuple(mem_objs_layer[page_chunks:]),
+                try:
+                    memory_objs_layer = (
+                        LayerPageSource(
+                            passive_page_tuple,
+                            layer_id,
+                            tuple(mem_objs_layer[page_chunks:]),
+                        )
+                        if passive_pages
+                        else mem_objs_layer
                     )
-                    if passive_pages
-                    else mem_objs_layer
-                )
+                    mem_obj_consumer.send(
+                        memory_objs_layer
+                        if layer_request is None
+                        else {
+                            "memory_objs": memory_objs_layer,
+                            "layer_request": layer_request,
+                        }
+                    )
+                except BaseException:
+                    consumer_failed = deferred_layerwise_get
+                    raise
                 if send_started:
                     consumer_send_s += serving_perf_now() - send_started
 
+            if deferred_layerwise_get:
+                if resolved_layers:
+                    # A skipped group has no consumer. Preserve that protocol;
+                    # ordinary P prefix loads prepare every layer here.
+                    if all(source is not None for source in prepared_sources):
+                        pointer_started = time.perf_counter() if prefill_timing else 0.0
+                        self._prepare_shared_prefill_sources(
+                            prepared_sources, kv_group, kwargs
+                        )
+                        if pointer_started:
+                            prefill_start_timing_log(
+                                logger,
+                                "passive_pointer_prepare",
+                                pointer_started,
+                                req_id=req_id,
+                                kv_group=kv_group,
+                                prefix_tokens=ends[-1] if ends else 0,
+                                chunks=len(starts),
+                            )
+                    sources_safe_to_release = False
+                try:
+                    consumer_send_s = yield from (
+                        self._submit_prepared_shared_prefill_layers(
+                            mem_obj_consumer, prepared_sources, ret_mask, perf_enabled
+                        )
+                    )
+                except Exception:
+                    consumer_failed = True
+                    raise
+            deferred_cleanup_gate_used = bool(
+                deferred_layerwise_get and mem_obj_consumer is not None
+            )
+            if deferred_cleanup_gate_used:
+                yield None
             if mem_obj_consumer is not None:
                 finish_started = serving_perf_now() if perf_enabled else 0.0
-                next(mem_obj_consumer)
+                try:
+                    next(mem_obj_consumer)
+                except BaseException:
+                    consumer_failed = deferred_layerwise_get
+                    raise
+                sources_safe_to_release = True
                 self._close_shared_retrieve_consumer(mem_obj_consumer)
                 mem_obj_consumer = None
                 if finish_started:
@@ -6111,6 +6312,10 @@ class LMCacheEngine:
                 )
                 if adopted:
                     to_release.clear()
+                    self._remember_shared_prefill_sources(
+                        req_id, kv_group, starts, ends, keys_layer_major,
+                        compact_batch, kwargs,
+                    )
                 elif kwargs.get("_retain_shared_dense_cache"):
                     raise RuntimeError("Dense shared source retention failed")
 
@@ -6148,20 +6353,30 @@ class LMCacheEngine:
                         3,
                     ),
                 )
-            yield None
+            if not deferred_cleanup_gate_used:
+                yield None
             # Keep request-owned shared objects through the final layer wait,
             # but release them before the result yield can remain suspended.
             self._release_shared_retrieve_objs(to_release, unpin=False)
             yield ret_mask
         finally:
             try:
-                self._close_shared_retrieve_consumer(mem_obj_consumer)
+                if mem_obj_consumer is not None:
+                    self._close_shared_retrieve_consumer(mem_obj_consumer)
+                    if not consumer_failed:
+                        sources_safe_to_release = True
             finally:
-                self._release_retained_dense_retrieve_objs(
-                    to_release,
-                    unpin=False,
-                    kwargs=kwargs,
-                )
+                if sources_safe_to_release:
+                    self._release_retained_dense_retrieve_objs(
+                        to_release,
+                        unpin=False,
+                        kwargs=kwargs,
+                    )
+                else:
+                    self._retain_unsafe_layerwise_retrieve_objs(
+                        to_release,
+                        context="Shared CPU passive retrieve",
+                    )
 
     def skip_shared_layerwise_retrieve(
         self,

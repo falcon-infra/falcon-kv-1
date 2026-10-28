@@ -302,7 +302,9 @@ class SharedCPURequestLease:
                     "Shared CPU request lease is not append-aligned: "
                     f"kv_group={kv_group}, append_at={append_at}"
                 )
-            updates.append((current, [list(layer[append_at:]) for layer in layers]))
+            updates.append(
+                (current, [list(layer[append_at:]) for layer in layers])
+            )
 
         for current, suffix in updates:
             for layer, layer_suffix in zip(current, suffix, strict=True):
