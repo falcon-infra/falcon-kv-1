@@ -12938,6 +12938,15 @@ class LMCacheConnectorV1Impl:
         ):
             raise ValueError("Layerwise storing is not supported with async store")
         logger.debug("store_async: %s", self.store_async)
+        # Cache the existing dense-load compatibility switches on scheduler and
+        # worker alike. Legacy staged copies cannot export async readiness.
+        self._resident_cold_load_enabled = not any(
+            os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
+            for name in (
+                "LMCACHE_ASCEND_DENSE_DIRECT_DISABLE",
+                "LMCACHE_ASCEND_DENSE_DIRECT_LOAD_DISABLE",
+            )
+        )
 
     def configure_live_latent_source(self, enabled: bool) -> None:
         """Apply the two-sided hybrid-transport capability decision."""
