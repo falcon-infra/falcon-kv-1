@@ -246,68 +246,18 @@ class KVLayerGroupsManager:
         group = self.get_group_by_layer_idx(layer_idx)
         return group.dtype if group else None
 
-    def build_kv_layer_groups(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Build KV layer groups structure by analyzing each layer's shape and dtype.
-
-        Layers with the same shape and dtype are grouped together. This is useful
-        because different layers may have different structures (especially the
-        last dimension head_size may differ between groups), and different groups
-        may have different dtypes.
-
-        If layer groups are already built (non-empty list), this method does nothing.
-
-        Args:
-            kv_caches: Dictionary mapping layer names to KV cache tensors.
-        """
-        # Skip if already built (non-empty list)
-        if len(self.kv_layer_groups) > 0:
-            return
-
-        if len(kv_caches) == 0:
-            logger.debug("No KV caches available, skipping KV layer groups building")
-            return
-
-        # Group layers by (shape, dtype) in a single loop
-        groups_dict: dict[tuple[object, ...], list[tuple[str, int]]] = defaultdict(list)
-        group_infos: dict[tuple[object, ...], tuple[torch.Size, torch.dtype]] = {}
-
-        for idx, (layer_name, kv_cache) in enumerate(kv_caches.items()):
-            key, shape, dtype = _get_kv_cache_group_key_and_info(kv_cache)
-            groups_dict[key].append((layer_name, idx))
-            group_infos[key] = (shape, dtype)
-
-        # Build KVLayerGroupInfo list
-        # Sort groups by the first layer index to maintain order
-        def _get_first_layer_index(shape_dtype_key):
-            """Get the index of the first layer in a layer group."""
-            layer_group = groups_dict[
-                shape_dtype_key
-            ]  # list of (layer_name, layer_index) tuples
-            first_layer_info = layer_group[0]  # first (layer_name, layer_index) tuple
-            layer_index = first_layer_info[1]  # extract the layer index
-            return layer_index
-
-        sorted_keys = sorted(groups_dict.keys(), key=_get_first_layer_index)
-
-        kv_layer_groups: list[KVLayerGroupInfo] = []
-        for key in sorted_keys:
-            shape, dtype = group_infos[key]
-            layers = groups_dict[key]
-            layer_names, layer_indices = zip(*layers, strict=False)
-
-            group_info = KVLayerGroupInfo(
-                layer_names=list(layer_names),
-                layer_indices=list(layer_indices),
-                shape=shape,
-                dtype=dtype,
-            )
-            kv_layer_groups.append(group_info)
-
-        # Store the built groups
-        self.kv_layer_groups = kv_layer_groups
-
-        # Print the group structure
-        logger.info("KV layer groups: %s", kv_layer_groups)
+    def build_kv_layer_groups(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        *,
+        indexer_c8_layout: IndexerC8Layout | None = None,
+    ) -> None:
+        """Build KV layer groups, including mixed indexer C8 descriptions."""
+        build_kv_layer_groups(
+            self,
+            kv_caches,
+            indexer_c8_layout=indexer_c8_layout,
+        )
 
 
 def _get_tuple_storage_shape(kv_cache: tuple[torch.Tensor, ...]) -> torch.Size:
@@ -369,3 +319,96 @@ def _get_kv_cache_group_key_and_info(
         return ((kv_cache.shape,), (kv_cache.dtype,)), kv_cache.shape, kv_cache.dtype
 
     raise RuntimeError(f"Unknown KVCache type: {type(kv_cache)}")
+
+def build_kv_layer_groups(
+    self,
+    kv_caches: dict[str, torch.Tensor],
+    *,
+    indexer_c8_layout: IndexerC8Layout | None = None,
+) -> None:
+    """Build KV layer groups structure by analyzing each layer's shape and dtype.
+
+    Layers with the same shape and dtype are grouped together. This is useful
+    because different layers may have different structures (especially the
+    last dimension head_size may differ between groups), and different groups
+    may have different dtypes.
+
+    If layer groups are already built (non-empty list), this method does nothing.
+
+    Args:
+        kv_caches: Dictionary mapping layer names to KV cache tensors.
+    """
+    # Skip if already built (non-empty list)
+    if len(self.kv_layer_groups) > 0:
+        return
+
+    if len(kv_caches) == 0:
+        logger.debug("No KV caches available, skipping KV layer groups building")
+        return
+
+    # Group layers by (shape, dtype) in a single loop
+    groups_dict: dict[tuple[object, ...], list[tuple[str, int]]] = defaultdict(list)
+    group_infos: dict[tuple[object, ...], tuple[torch.Size, torch.dtype]] = {}
+
+    indexer_layer = 0
+    for idx, (layer_name, kv_cache) in enumerate(kv_caches.items()):
+        key, shape, dtype = _get_kv_cache_group_key_and_info(kv_cache)
+        if (
+            indexer_c8_layout is not None
+            and indexer_c8_layout.mixed
+            and "indexer" in layer_name
+        ):
+            quantized = indexer_c8_layout.is_c8_for_layer(
+                layer_name, indexer_layer
+            )
+            planes = kv_cache if isinstance(kv_cache, tuple) else (kv_cache,)
+            if (planes[0].dtype == torch.int8) != quantized:
+                raise ValueError(
+                    "Registered indexer dtype disagrees with model policy: "
+                    f"layer={layer_name!r} dtype={planes[0].dtype} "
+                    f"expected_c8={quantized}"
+                )
+            key = ("mixed_indexer",)
+            # Per-layer byte extents live in metadata; this width is a staging bound.
+            shape = torch.Size([planes[0].shape[0], planes[0].shape[1], 256])
+            dtype = torch.uint8
+            indexer_layer += 1
+        groups_dict[key].append((layer_name, idx))
+        group_infos[key] = (shape, dtype)
+
+    if indexer_c8_layout is not None and indexer_c8_layout.mixed:
+        if indexer_layer != len(indexer_c8_layout.c8_layers):
+            raise ValueError("Registered indexer layers disagree with precision policy")
+
+    # Build KVLayerGroupInfo list
+    # Sort groups by the first layer index to maintain order
+    def _get_first_layer_index(shape_dtype_key):
+        """Get the index of the first layer in a layer group."""
+        layer_group = groups_dict[
+            shape_dtype_key
+        ]  # list of (layer_name, layer_index) tuples
+        first_layer_info = layer_group[0]  # first (layer_name, layer_index) tuple
+        layer_index = first_layer_info[1]  # extract the layer index
+        return layer_index
+
+    sorted_keys = sorted(groups_dict.keys(), key=_get_first_layer_index)
+
+    kv_layer_groups: list[KVLayerGroupInfo] = []
+    for key in sorted_keys:
+        shape, dtype = group_infos[key]
+        layers = groups_dict[key]
+        layer_names, layer_indices = zip(*layers, strict=False)
+
+        group_info = KVLayerGroupInfo(
+            layer_names=list(layer_names),
+            layer_indices=list(layer_indices),
+            shape=shape,
+            dtype=dtype,
+        )
+        kv_layer_groups.append(group_info)
+
+    # Store the built groups
+    self.kv_layer_groups = kv_layer_groups
+
+    # Print the group structure
+    logger.info("KV layer groups: %s", kv_layer_groups)

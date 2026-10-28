@@ -27,6 +27,9 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.kv_layer_groups import (
+    validate_two_group_layer_counts,
+)
 from lmcache.v1.mooncake_layout import (
     MOONCAKE_VALID_TOKENS_TAG,
     mooncake_valid_tokens,
@@ -230,15 +233,30 @@ class RemoteFillGroupLayout:
     raw_token_dim: int
     dtype: torch.dtype
     fmt: MemoryFormat
+    layer_token_dims: tuple[int, ...] = ()
 
     def full_shape(self, chunk_size: int) -> torch.Size:
         """Return the flat full-page shape for one layer."""
 
         return torch.Size([chunk_size * self.raw_token_dim])
 
+    def page_shapes(self, chunk_size: int) -> list[torch.Size]:
+        """Return exact layer extents, or the homogeneous allocator template."""
+        return (
+            [torch.Size([chunk_size * width]) for width in self.layer_token_dims]
+            if self.layer_token_dims
+            else [self.full_shape(chunk_size)]
+        )
+
     def expected_bytes(self, valid_tokens: int, num_layers: int) -> int:
         """Return exact bytes for one physical all-layer page."""
 
+        if self.layer_token_dims:
+            if len(self.layer_token_dims) != num_layers:
+                raise ValueError(
+                    "RemoteFill precision policy disagrees with layer count"
+                )
+            return valid_tokens * sum(self.layer_token_dims) * self.dtype.itemsize
         return valid_tokens * self.raw_token_dim * self.dtype.itemsize * num_layers
 
 
@@ -390,6 +408,13 @@ def build_decoder_layout(
         raise ValueError("remote-fill layout identity must not be empty")
     if num_layers <= 0:
         raise ValueError("remote-fill layer count must be positive")
+    counts = getattr(metadata, "runtime_kv_group_layer_counts", None)
+    if counts is not None:
+        counts = validate_two_group_layer_counts(counts)
+        if counts[0] != num_layers:
+            raise ValueError(
+                "RemoteFill latent layers disagree with runtime topology"
+            )
     dtypes = metadata.get_dtypes()
     group0_dtype = dtypes[0] if dtypes else metadata.kv_dtype
     group1_dtype = dtypes[1] if len(dtypes) > 1 else group0_dtype
@@ -423,6 +448,15 @@ def build_decoder_layout(
                 raw_token_dim=dimensions[1],
                 dtype=group1_dtype,
                 fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+                layer_token_dims=(
+                    tuple(
+                        metadata.indexer_c8_layout.token_bytes_for(i)
+                        for i in range(counts[1])
+                    )
+                    if metadata.indexer_c8_layout is not None
+                    and metadata.indexer_c8_layout.mixed
+                    else ()
+                ),
             ),
         ),
     )
@@ -739,9 +773,10 @@ class AscendRemoteFillPageLifecycle:
                 if not indices:
                     continue
                 group_layout = self._layout.group(kv_group)
+                page_shapes = group_layout.page_shapes(self._layout.chunk_size)
                 group_pages = self._local.batched_allocate_layer_pages(
-                    [group_layout.full_shape(self._layout.chunk_size)],
-                    [group_layout.dtype],
+                    page_shapes,
+                    [group_layout.dtype] * len(page_shapes),
                     len(indices),
                     self._layout.num_layers,
                     group_layout.fmt,

@@ -3363,8 +3363,8 @@ def test_coordinator_ascend_preemption_preserves_real_engine_drop_ownership(fata
     import gc
     import weakref
     from dataclasses import replace
-    from lmcache.integration.vllm.vllm_v1_adapter import (
-        LMCacheConnectorV1Impl,
+    from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+        LMCacheAscendConnectorV1Impl,
     )
 
     class Owner:
@@ -3383,7 +3383,7 @@ def test_coordinator_ascend_preemption_preserves_real_engine_drop_ownership(fata
         PreparedDirectPushSource(source, 0, 0, 0),
     )
     session.fatal_restart_required = fatal
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(blocking_timeout_secs=1)
     state = _DirectStoreRequestState(
         remote_fill=ProducerRequestState(handoff=_handoff(), session=session)
@@ -3396,11 +3396,11 @@ def test_coordinator_ascend_preemption_preserves_real_engine_drop_ownership(fata
     engine._init_failed = False
     engine._health_monitor = None
     order = []
-    engine.wait_for_pending_stores = lambda _ids: order.append("persistent") or set()
+    engine.wait_for_pending_stores = lambda _ids: (order.append("persistent") or set())
     _coordinator(engine)
-    adapter = object.__new__(LMCacheConnectorV1Impl)
-    adapter.lmcache_engine = engine
+    adapter = object.__new__(LMCacheAscendConnectorV1Impl)
     adapter._parent = SimpleNamespace(has_connector_metadata=lambda: False)
+    adapter.lmcache_engine = engine
     adapter.store_async = True
     adapter.kv_role = "kv_producer"
     adapter._drop_worker_retrieve_state = lambda _req: order.append("retrieve")
