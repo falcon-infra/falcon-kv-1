@@ -12845,6 +12845,19 @@ class LMCacheConnectorV1Impl:
                     source_ready_event=source_ready_event,
                     source_ready_event_source=source_ready_event_source,
                     source_ready_events=source_ready_events,
+                    prefix_slot_mappings=(
+                        {
+                            group: (
+                                request.indexer_slot_mapping
+                                if group else request.slot_mapping
+                            )[0]
+                            for group in selected
+                        }
+                        if remote_fill_request and verified_prefix_end > 0
+                        and not request.is_sparse_decode
+                        and request.slot_mapping and request.indexer_slot_mapping
+                        else None
+                    ),
                 )
             if finalized_live and direct_store and selected and not direct_final:
                 self._unfenced_live_stores[request.req_id] = request
