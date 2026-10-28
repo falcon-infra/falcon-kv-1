@@ -169,6 +169,8 @@ class VllmServiceFactory(BaseServiceFactory):
             max_model_len=getattr(model_config, "max_model_len", None),
             runtime_kv_group_layer_counts=self.runtime_kv_group_layer_counts,
             runtime_kv_group_layer_names=self.runtime_kv_group_layer_names,
+            indexer_c8_layout=self.indexer_c8_layout,
+            indexer_hbm_block_map=self.indexer_hbm_block_map,
             mla_cache_tp_replicated=(
                 use_mla
                 and num_kv_head == 1
