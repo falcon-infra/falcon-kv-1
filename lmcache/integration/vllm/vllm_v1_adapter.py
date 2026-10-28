@@ -13632,6 +13632,9 @@ class LMCacheConnectorV1Impl:
         return delay_free and not predispatch_cancelled, return_params
 
     def _submit_dsa_cold_compact_load(self, request: ReqMeta) -> None:
+        if hasattr(request.load_spec, "checkpoint_generation"):
+            # The local index tail uses the existing CPU-load stream/fences.
+            request.load_spec.dsa_group1_direct_hbm = False
         coordinator = getattr(self, "_cold_load_coordinator", None)
         retirements = coordinator.retirements if coordinator is not None else None
         if retirements and any(
@@ -13737,6 +13740,39 @@ class LMCacheConnectorV1Impl:
         previous_latent_future: Optional[Future] = None,
         live_state: Optional[WorkerRetrieveState] = None,
     ) -> WorkerRetrieveState:
+        request = plan["request"]
+        if hasattr(request.load_spec, "checkpoint_generation"):
+            owners = []
+            try:
+                if npu_device_id is not None:
+                    torch.npu.set_device(npu_device_id)
+                if previous_latent_future is not None:
+                    try:
+                        previous_latent_future.exception()
+                    except BaseException:
+                        pass  # Preserve ordering without inheriting an older failure.
+                _, owners = self.lmcache_engine.prepare_checkpoint_restore(
+                    request
+                )
+                if owners:
+                    self.lmcache_engine.checkpoint_worker.hold_restore(
+                        request.req_id,
+                        request.load_spec.checkpoint_generation,
+                        request.load_spec.dsa_cold_load_generation,
+                        owners,
+                    )
+                    owners = []
+                return self._common_run_dsa_cold_compact_load(
+                    plan, npu_device_id, indexer_future, None, live_state
+                )
+            except BaseException as error:
+                gate = plan["latent_shared_ready"]
+                if not gate.done():
+                    gate.set_exception(error)
+                raise
+            finally:
+                for page in owners:
+                    page.ref_count_down()
         if npu_device_id is not None:
             torch.npu.set_device(npu_device_id)
         request = plan["request"]
@@ -14028,6 +14064,46 @@ class LMCacheConnectorV1Impl:
         started = serving_perf_now() if perf_breakdown is not None else 0.0
         queue_ms = (started - plan["planned_at"]) * 1000
         request = plan["request"]
+        if hasattr(request.load_spec, "checkpoint_generation"):
+            if self.config.pd_role is None:
+                # Standalone keeps both groups in the ordinary shared-CPU path.
+                plan["latent_shared_ready"].result()
+            else:
+                error = None
+                try:
+                    plan["latent_shared_ready"].result()
+                    if npu_device_id is not None:
+                        torch.npu.set_device(npu_device_id)
+                    chunk = self._lmcache_chunk_size
+                    base = request.load_spec.checkpoint_prefix_end // chunk * chunk
+                    if base:
+                        self.lmcache_engine.load_group1_pages_direct(
+                            plan["tokens"][:base],
+                            plan["indexer_slots_cpu"][:base],
+                            plan["indexer_kvcaches"],
+                            request.request_configs,
+                            request.req_id,
+                        )
+                    tail = dict(plan)
+                    tail["token_mask"] = plan["token_mask"].clone()
+                    tail["token_mask"][:base] = False
+                    tail["token_count"] -= base
+                except BaseException as exc:
+                    error = exc
+                agreed = self.lmcache_engine.finish_checkpoint_prefix(
+                    request, error is None
+                )
+                if error is not None:
+                    raise error
+                if not agreed:
+                    raise RuntimeError(
+                        "Checkpoint prefix failed on another TP rank"
+                    )
+                result = self._common_run_dsa_cold_indexer_load(
+                    tail, npu_device_id
+                )
+                # Both the persistent prefix and the CPU tail are ready.
+                return plan["token_mask"], result[1], result[2], result[3]
         indexer_slots_cpu = plan["indexer_slots_cpu"]
         indexer_kvcaches = plan["indexer_kvcaches"]
         validate_slots = getattr(
