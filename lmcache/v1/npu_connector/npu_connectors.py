@@ -67,6 +67,7 @@ from lmcache.v1.transfer_context import AscendBaseTransferContext
 import lmcache.c_ops as lmc_ops
 from lmcache.v1.serving_perf import prefill_start_timing_enabled, prefill_start_timing_log, serving_perf_detailed_enabled, serving_perf_enabled, serving_perf_log
 from lmcache.v1.npu_connector.layerwise_dma import BoundCopyPrefix, bind_copy_addresses, bind_incremental_copy_addresses
+from lmcache.v1.serving_perf import prefill_reuse_debug_enabled, prefill_reuse_debug_log, prefill_start_timing_enabled, prefill_start_timing_log, serving_perf_detailed_enabled, serving_perf_enabled, serving_perf_log
 
 logger = init_logger(__name__)
 _COLD_PERF_SLOW_MS = 100.0
@@ -1251,6 +1252,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
     ):
         self._common_init(hidden_dim_size, num_layers, use_gpu, **kwargs)
 
+        self._prefill_worker_id = int(kwargs.get("worker_id", -1))
         self.load_stream_num = 4
         self.load_stream_list = [
             torch.npu.Stream() for __ in range(self.load_stream_num)
@@ -4639,18 +4641,6 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         device: Optional[torch.device] = None,
         layout_hints: Optional[LayoutHints] = None,
     ) -> "VLLMPagedMemLayerwiseNPUConnector":
-        if getattr(metadata, "indexer_c8_layout", None) is not None and not all(
-            hasattr(lmc_ops, name)
-            for name in (
-                "IndexerC8State",
-                "IndexerC8GroupState",
-                "indexer_c8_transfer_prepared",
-                "indexer_c8_group_transfer_prepared",
-            )
-        ):
-            raise RuntimeError(
-                "Indexer C8 requires rebuilding the LMCache-Ascend native extension"
-            )
         num_layers = metadata.kv_shape[0]
         chunk_size = metadata.kv_shape[2]
         num_kv_head = metadata.kv_shape[3]
@@ -4667,7 +4657,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             use_mla=metadata.use_mla,
             layout_hints=layout_hints,
             max_staging_tokens=max_staging_tokens,
-            indexer_c8_layout=getattr(metadata, "indexer_c8_layout", None),
+            worker_id=metadata.worker_id,
         )
 
     def _assign_group_gpu_allocator(
@@ -5171,6 +5161,14 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         dma_plans = None
         dma_req_id = kwargs.get("req_id") if prefill_dma else None
         bound_loads = None
+        reuse_debug = prefill_dma and prefill_reuse_debug_enabled(
+            getattr(self, "_prefill_worker_id", -1)
+        )
+        if reuse_debug:
+            debug_phase_drops = debug_map_drops = 0
+            debug_reused = debug_rebuilt = debug_layers = 0
+            debug_submit_ms = 0.0
+            debug_layer_count = min(2, self._expected_group_layers(kv_group))
         if prefill_dma:
             dma_plans = _prefill_dma_plans(
                 kwargs["prefill_dma_block_ids_by_bank"],
@@ -5195,6 +5193,8 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                     for cache_key in tuple(bound_loads):
                         if cache_key[0] == kv_group:
                             bound_loads.pop(cache_key)
+                            if reuse_debug:
+                                debug_phase_drops += 1
                 bank_offsets[int(kv_group)] = layerwise_prefill_bank_offset
                 slot_snapshots = self._prefill_dma_slot_snapshots.setdefault(
                     dma_req_id, {}
@@ -5219,6 +5219,8 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                                 == bank
                             ):
                                 bound_loads.pop(cache_key)
+                                if reuse_debug:
+                                    debug_map_drops += 1
                     slot_snapshots[(kv_group, bank)] = block_ids
         if dense_direct and not prefill_dma:
             (
@@ -5395,6 +5397,8 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                             and not previous_tail[1].query()
                         )
                         bind_started = time.perf_counter()
+                    if reuse_debug and layer_id < debug_layer_count:
+                        debug_submit_started = time.perf_counter()
                     bound = bind_incremental_copy_addresses(
                         dma_plans[bank], source_objs, starts, ends,
                         [int(t.data_ptr()) for t in kvcaches_snapshot[layer_id]],
@@ -5419,6 +5423,10 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                     copies = bound.rows
                     if diagnose_bank_load:
                         bind_ms = (time.perf_counter() - bind_started) * 1000
+                    if reuse_debug and layer_id < debug_layer_count:
+                        debug_reused += bound.reused_chunks
+                        debug_rebuilt += len(source_objs) - bound.reused_chunks
+                        debug_layers += 1
                     # Save and load for one physical bank share one FIFO
                     # stream.  The preceding save is therefore ordered
                     # before this H2D without a separate event wait; no
@@ -5436,6 +5444,10 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                         event_record_started = time.perf_counter()
                     load_done_event = torch.npu.Event()
                     load_done_event.record(bank_stream)
+                    if reuse_debug and layer_id < debug_layer_count:
+                        debug_submit_ms += (
+                            time.perf_counter() - debug_submit_started
+                        ) * 1000
                     if diagnose_bank_load:
                         event_record_ms = (
                             time.perf_counter() - event_record_started
@@ -5465,6 +5477,20 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                                 previous_tail[2]
                                 if previous_tail is not None else None
                             ),
+                        )
+                    if reuse_debug and layer_id + 1 == debug_layer_count:
+                        prefill_reuse_debug_log(
+                            self._prefill_worker_id,
+                            "dma",
+                            req_id=dma_req_id or "",
+                            p=int(ends[-1]) if ends else 0,
+                            g=kv_group,
+                            n=len(starts),
+                            l=debug_layers,
+                            x=f"{debug_reused}/{debug_rebuilt}",
+                            drop=f"{debug_phase_drops}/{debug_map_drops}",
+                            plan="full",
+                            ms=debug_submit_ms,
                         )
                 elif dense_direct:
                     if deferred_dense_direct_get:
