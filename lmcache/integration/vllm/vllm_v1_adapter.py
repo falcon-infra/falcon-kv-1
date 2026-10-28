@@ -6889,11 +6889,17 @@ class LMCacheConnectorV1Impl:
                 # Only the completed cold worker hands off an unchanged sealed
                 # state. Generic store/metadata publication must still rebuild.
                 sources = state.prepared_sparse_sources
-                if 0 not in sources or any(
-                    source.total_tokens != token_count for source in sources.values()
+                if (
+                    len(state.metadata_token_ids) != token_count
+                    or 0 not in sources
+                    or any(
+                        source.total_tokens != token_count
+                        for source in sources.values()
+                    )
                 ):
                     raise RuntimeError(
-                        "Cold publication requires sealed sources at the load frontier"
+                        "Cold publication requires sealed sources and token snapshot "
+                        "at the load frontier"
                     )
             else:
                 self._refresh_prepared_sparse_sources(state, token_count)
@@ -6902,7 +6908,11 @@ class LMCacheConnectorV1Impl:
                 request,
                 previous_token_count,
             )
-            if not request.sparse_warm_ref and len(request.token_ids) >= token_count:
+            if (
+                not reuse_prepared_sources
+                and not request.sparse_warm_ref
+                and len(request.token_ids) >= token_count
+            ):
                 state.metadata_token_ids = request.token_ids[:token_count]
         except Exception:
             self._release_unadopted_shared_request_objects(state, request)
