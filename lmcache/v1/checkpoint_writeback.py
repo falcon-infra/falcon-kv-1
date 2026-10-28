@@ -8,7 +8,7 @@ import logging
 import time
 
 from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
-from lmcache_ascend.v1.local_checkpoint import (
+from lmcache.v1.local_checkpoint import (
     CheckpointPage,
     LocalCheckpoint,
     LocalCheckpointStore,

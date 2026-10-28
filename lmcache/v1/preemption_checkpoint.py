@@ -85,7 +85,7 @@ class CheckpointWorker:
         self.chunk_size = int(engine.config.chunk_size)
         self.local = LocalCheckpointStore(engine)
         if getattr(engine.config, "decode_checkpoint_writeback", False):
-            from lmcache_ascend.v1.checkpoint_writeback import CheckpointWritebackStore
+            from lmcache.v1.checkpoint_writeback import CheckpointWritebackStore
 
             self.local = CheckpointWritebackStore(engine, self.executor)
 

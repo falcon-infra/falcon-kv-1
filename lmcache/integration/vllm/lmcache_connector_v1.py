@@ -437,7 +437,7 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
             from vllm.v1.core.dsa_shared_pool import (
                 DSASharedBlockLayout, layerwise_prefill_bundle_multiplier,
             )
-            from lmcache_ascend.v1.npu_connector.layerwise_dma import (
+            from lmcache.v1.npu_connector.layerwise_dma import (
                 build_group_cycles,
                 cache_page_size_bytes,
             )

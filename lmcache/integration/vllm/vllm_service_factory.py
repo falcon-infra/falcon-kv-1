@@ -210,7 +210,7 @@ class VllmServiceFactory(BaseServiceFactory):
         # First Party
         from lmcache.integration.vllm.utils import ENGINE_NAME
         from lmcache.utils import EngineType
-        from lmcache.v1.gpu_connector import CreateGPUConnector
+        from lmcache.v1.npu_connector import CreateNPUConnector
 
         if curr_engine := LMCacheEngineBuilder.get(ENGINE_NAME):
             self.lmcache_engine = curr_engine
@@ -243,7 +243,7 @@ class VllmServiceFactory(BaseServiceFactory):
             # First Party
             from lmcache.integration.vllm.utils import vllm_layout_hints
 
-            vllm_gpu_connector = CreateGPUConnector(
+            vllm_gpu_connector = CreateNPUConnector(
                 self.lmcache_config,
                 self.metadata,
                 EngineType.VLLM,

@@ -162,10 +162,9 @@ from lmcache.v1.token_database import (
     SegmentTokenDatabase,
     TokenDatabase,
 )
-from lmcache.v1.memory_management import CuFileMemoryAllocator, LayerPageMemoryObj, LayerPageSource, MemoryAllocatorInterface, MemoryFormat, MemoryObj, MemoryObjMetadata, MixedMemoryAllocator, PagedTensorMemoryAllocator, TensorMemoryObj
+from lmcache.v1.memory_management import LayerPageMemoryObj, LayerPageSource, MemoryAllocatorInterface, MemoryFormat, MemoryObj, MemoryObjMetadata, MixedMemoryAllocator, PagedTensorMemoryAllocator, TensorMemoryObj
 from lmcache.v1.remote_fill import ControlPage, log_remote_fill_diagnostic
 from lmcache.v1.direct_store_plan import DirectPageBatch, build_remote_fill_source_plan, merge_deferred_remote_fill_batches, select_remote_fill_batch_pages
-from lmcache.v1.remote_fill import DecoderRemoteFillRuntime, RemoteFillDecoderLayout, build_decoder_layout, create_decoder_remote_fill_runtime
 from lmcache.v1.serving_perf import prefill_start_timing_enabled, prefill_start_timing_log, serving_perf_enabled, serving_perf_log, serving_perf_now, serving_perf_scope
 from lmcache.v1.startup_trace import startup_phase
 from lmcache.v1.layerwise_cpu_fill import LayerwiseCPUFillLease, LayerwisePutQueue
@@ -20056,13 +20055,8 @@ class LMCacheEngineBuilder:
                 device=corrected_device,
             )
 
-            if corrected_device == "cpu":
-                torch.npu.cudart().cudaHostRegister(
-                    buffer.data_ptr(), config.nixl_buffer_size, 0
-                )
-            else:
-                logger.info(f"Setting cuda device to {corrected_device} ")
-                torch.npu.set_device(corrected_device)
+            logger.info(f"Using device {corrected_device}")
+            torch.npu.set_device(corrected_device)
 
             return PagedTensorMemoryAllocator(
                 buffer,
@@ -20070,10 +20064,6 @@ class LMCacheEngineBuilder:
                 [metadata.kv_dtype],
                 MemoryFormat.KV_2LTD,
             )
-
-        if config.gds_path is not None:
-            assert config.cufile_buffer_size is not None
-            return CuFileMemoryAllocator(config.cufile_buffer_size * 1024**2)
 
         max_local_cpu_size = config.max_local_cpu_size
         # save_only_first_rank only works when use mla

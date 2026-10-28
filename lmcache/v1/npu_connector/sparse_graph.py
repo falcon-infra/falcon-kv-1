@@ -6,11 +6,11 @@ from collections.abc import Sequence
 
 # Third Party
 import torch
-from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
+from lmcache.v1.device_connector.sparse import PreparedSparseSource
 
 # First Party
-from lmcache_ascend.v1.kv_format import KVCacheFormat
-from lmcache_ascend.v1.npu_connector.utils import (
+from lmcache.v1.kv_format import KVCacheFormat
+from lmcache.v1.npu_connector.utils import (
     prepare_sparse_direct_destination_state,
     sparse_graph_kv_transfer,
 )

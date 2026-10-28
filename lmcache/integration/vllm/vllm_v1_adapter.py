@@ -100,14 +100,12 @@ from lmcache.v1.serving_perf import (
     serving_perf_log,
     serving_perf_now,
 )
-from vllm_ascend.live_source_handoff import LIVE_SOURCE_EVENT_HANDOFF_KEY
 from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.serving_perf import prefill_reuse_debug_enabled, prefill_reuse_debug_log, prefill_start_timing_enabled, prefill_start_timing_log, serving_perf_enabled, serving_perf_log, serving_perf_now
 from copy import deepcopy
 from lmcache.v1.prefill_metadata import PrefillMetadataCache
 from functools import partial
-from vllm_ascend import envs
-from lmcache.v1.npu_connector.prefill_overlap import AclEventTimer, PrefillOverlapRecorder, single_request_span
+from lmcache.v1.npu_connector.prefill_overlap import AclEventTimer, PrefillOverlapRecorder
 from lmcache.v1.npu_connector.prefill_overlap import AclEventTimer, PrefillOverlapRecorder, request_spans
 
 # Use LMCache's own math utilities instead of vllm's

@@ -3048,8 +3048,6 @@ def test_mooncake_unequal_page_groups_use_representative_cardinality() -> None:
     assert legacy_indices == [5]
 
 
-
-
 def test_mooncake_layer_page_get_allocates_one_object_per_chunk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
