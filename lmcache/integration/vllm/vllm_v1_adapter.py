@@ -5056,10 +5056,21 @@ class LMCacheConnectorV1Impl:
             )
             self._forget_layerwise_store_results(req_ids)
         for req_id in req_ids:
+            forget = getattr(self.lmcache_engine, "forget_checkpoint_request", None)
+            if forget is not None:
+                forget(req_id)
             self._cold_perf_dense_load_started.pop(req_id, None)
             self._cold_perf_dense_load_completed.pop(req_id, None)
             self._drop_layerwise_save_storers(req_id)
             self._drop_worker_retrieve_state(req_id, defer_dense_release=True)
+            release_prefill_pages = getattr(
+                self.lmcache_engine, "release_layerwise_prefill_pages", None
+            )
+            if (
+                getattr(self, "_layerwise_prefill_p_node", False)
+                and release_prefill_pages is not None
+            ):
+                release_prefill_pages(req_id)
         # get_finished calls this even with no new finishes. Poll here once,
         # inside its measured finalization scope, not on every load submission.
         self._drain_dense_load_retirements()
@@ -5151,7 +5162,10 @@ class LMCacheConnectorV1Impl:
         )
         for kv_group in (0, 1):
             cache = state.cache_kwargs(kv_group, dsa_two_groups=True)
-            if callable(release_pointer_cache):
+            if (
+                state.dense_prefix_generation is not None
+                and callable(release_pointer_cache)
+            ):
                 release_pointer_cache(cache["cached_chunk_ptrs_npu"])
             for name in (
                 "cached_memory_objs",
@@ -6425,12 +6439,9 @@ class LMCacheConnectorV1Impl:
                 return True
             for layer_id, selected in enumerate(selected_ptrs_by_layer):
                 existing = dst_chunk_ptrs_npu[layer_id]
-                if existing is not None:
-                    raise RuntimeError(
-                        "Layerwise pointer merge requires a request-owned "
-                        "incremental table"
-                    )
-                dst_chunk_ptrs_npu[layer_id] = selected
+                dst_chunk_ptrs_npu[layer_id] = (
+                    selected if existing is None else torch.cat((existing, selected))
+                )
             return True
 
         if not append_layer_ptr_tensors():
@@ -6483,8 +6494,11 @@ class LMCacheConnectorV1Impl:
             src_chunk_ptrs_npu=result.chunk_ptrs,
             src_shared_handles=[],
             require_pointer_cache=require_pointer_cache,
-            pointer_table=destination.pointer_tables.setdefault(
-                result.kv_group, LayerwisePointerTable()
+            pointer_table=(
+                destination.pointer_tables.setdefault(
+                    result.kv_group, LayerwisePointerTable()
+                )
+                if getattr(self, "_layerwise_prefill_p_node", False) else None
             ),
             append_from=append_from,
         )
@@ -6745,15 +6759,24 @@ class LMCacheConnectorV1Impl:
             cached_ends = cache["cached_ends"]
             chunk_token_counts = None
             if cached_starts and len(cached_starts) == len(cached_ends):
-                # Under TP, indexer store completion precedes the deferred
-                # latent flush. Its raw cache can already cover the next
-                # prefill chunk while token_count still follows latent.
-                # Preserve that cache, but publish only an exact-frontier
-                # source; the latent flush will refresh both groups again.
-                if (
-                    self._cached_prefix_covered_token_count(cached_starts, cached_ends)
-                    != token_count
+                if not getattr(self, "_layerwise_prefill_p_node", False):
+                    if self._cached_prefix_covered_token_count(
+                        cached_starts, cached_ends
+                    ) != token_count:
+                        continue
+                elif not self._cached_ranges_cover_prefix(
+                    cached_starts, cached_ends, token_count
                 ):
+                    continue
+                if (
+                    getattr(self, "_layerwise_prefill_p_node", False)
+                    and int(cached_ends[-1]) > token_count
+                ):
+                    # Chunked prefill stores publish each KV group separately.
+                    # Indexer may already cover the next chunk while latent
+                    # still defines the previous request frontier. Retain all
+                    # group data, but do not seal it as a shorter source. The
+                    # next promotion rebuilds it when the frontier catches up.
                     continue
                 chunk_token_counts = tuple(
                     int(end) - int(start)
@@ -9316,10 +9339,33 @@ class LMCacheConnectorV1Impl:
                 selected_tokens/target_slot_mapping/selected_token_counts were
                 built. LMCache waits on this before row-selecting those tensors.
         """
+        wait_group = None
+        if self.supports_layerwise_prefill_transfer_window:
+            wait_group = self._layerwise_wait_group(layer_name)
+            # This fence is required even on a cache miss. Layer N and N-2 use
+            # the same two-bank slot; N must not overwrite it while save(N-2)
+            # is still reading from that bank.
+            self._wait_for_layerwise_prefill_bank(layer_name, wait_group)
+
         if self.layerwise_retrievers and logger.isEnabledFor(10):
             logger.debug("Waiting for layer %d to be loaded", self.current_layer)
 
         if not self.layerwise_retrievers:
+            return
+
+        if getattr(self, "_deferred_layerwise_prefill_load_active", False):
+            # The bank fence above makes the current layer consumable. Advancing
+            # N+1 is submitted from the post-attention HCOM window.
+            _, layer_id, last_group_layer = self._layerwise_prefill_load_position(
+                layer_name,
+                wait_group,
+            )
+            if layer_id == last_group_layer:
+                # No N+1 exists. Finish the suspended generators here, after
+                # the last layer's current-bank fence and before its compute.
+                self._advance_deferred_layerwise_prefill_load(
+                    layer_name, finish_current=True
+                )
             return
 
         metadata: Optional[LMCacheConnectorMetadata] = None
@@ -9380,7 +9426,9 @@ class LMCacheConnectorV1Impl:
                 else len(selected_tokens)
             )
 
-        wait_group = self._layerwise_wait_group(layer_name)
+        if wait_group is None:
+            wait_group = self._layerwise_wait_group(layer_name)
+
         parsed_layer_id = None
         parsed_layer_id_loaded = False
         sparse_indexer_sent_layers = None
@@ -9608,6 +9656,13 @@ class LMCacheConnectorV1Impl:
                                 self._layerwise_sparse_indexer_sent_layers = (
                                     sparse_indexer_sent_layers
                                 )
+                        has_indexer_model_layer = (
+                            parsed_layer_id is not None
+                            and parsed_layer_id == self.current_layer
+                            and self._layerwise_has_indexer_model_layer(
+                                parsed_layer_id
+                            )
+                        )
                     if wait_group == 1:
                         ret_token_mask = None
                         if (
@@ -9630,7 +9685,7 @@ class LMCacheConnectorV1Impl:
                                     _SHARED_SPARSE_DEFER_COMMIT: (
                                         shared_ordered
                                         and self.current_layer
-                                        == self.num_layers - 1
+                                        == self._last_indexer_model_layer
                                     ),
                                 }
                                 if shared_ordered
@@ -9643,6 +9698,7 @@ class LMCacheConnectorV1Impl:
                             indexer_retriever is not None
                             and sparse_indexer_sent_layers is not None
                             and indexer_sent_key not in sparse_indexer_sent_layers
+                            and has_indexer_model_layer
                         ):
                             indexer_ret_mask = indexer_retriever.send((None, 0))
                             sparse_indexer_sent_layers.add(indexer_sent_key)
@@ -9652,7 +9708,8 @@ class LMCacheConnectorV1Impl:
                             indexer_retriever is not None
                             and shared_ordered
                             and self.current_layer == self.num_layers - 1
-                            and indexer_sent_key in sparse_indexer_sent_layers
+                            and (request.req_id, self._last_indexer_model_layer)
+                            in sparse_indexer_sent_layers
                         ):
                             indexer_ret_mask = next(indexer_retriever)
                             if ret_token_mask is None:
@@ -9669,7 +9726,12 @@ class LMCacheConnectorV1Impl:
                         ret_token_mask = next(layerwise_retriever)
 
                 if (
-                    self.current_layer == self.num_layers - 1
+                    self.current_layer
+                    == (
+                        self._last_indexer_model_layer
+                        if wait_group == 1
+                        else self.num_layers - 1
+                    )
                     and not request.is_sparse_decode
                     and (wait_group == 0 or indexer_retriever is not None)
                 ):
@@ -9687,90 +9749,11 @@ class LMCacheConnectorV1Impl:
                     )
                 idx += 1
 
-        if self.layerwise_retrievers and self._layerwise_wait_should_advance(
-            wait_group
-        ):
-            self.current_layer += 1
-            if self.current_layer >= self.num_layers:
-                completed_requests = tuple(layerwise_requests)
-                perf_enabled = serving_perf_enabled()
-                dense_perf_states = ()
-                if perf_enabled:
-                    dense_perf_states = [
-                        (
-                            request,
-                            self._cold_perf_dense_load_started.get(
-                                request.req_id,
-                                None,
-                            ),
-                        )
-                        for request in completed_requests
-                    ]
-                finalize_started = (
-                    serving_perf_now()
-                    if perf_enabled
-                    and (
-                        any(
-                            request.req_id in self._cold_perf_load_started
-                            for request in completed_requests
-                        )
-                        or any(state is not None for _, state in dense_perf_states)
-                    )
-                    else 0.0
-                )
-                with self._sparse_retrieve_state_guard(
-                    completed_requests
-                ):
-                    if metadata is None:
-                        metadata = self._parent._get_connector_metadata()
-                        assert isinstance(metadata, LMCacheConnectorMetadata)
-                    self._finalize_worker_retrieve_state_from_metadata(metadata)
-                    self._drain_layerwise_retrievers()
-                finalize_ms = (
-                    (serving_perf_now() - finalize_started) * 1000
-                    if finalize_started
-                    else 0.0
-                )
-                if perf_enabled:
-                    dense_completed = serving_perf_now()
-                    for request, perf_state in dense_perf_states:
-                        if perf_state is None:
-                            continue
-                        self._cold_perf_dense_load_started.pop(request.req_id, None)
-                        request_started, token_count = perf_state
-                        self._cold_perf_dense_load_completed[request.req_id] = (
-                            dense_completed
-                        )
-                        serving_perf_log(
-                            logger,
-                            "dense_worker_load_complete",
-                            started=request_started,
-                            req_id=request.req_id,
-                            tokens=token_count,
-                            layers=self.num_layers,
-                            finalize_ms=round(finalize_ms, 3),
-                            scope="layerwise_wall",
-                            includes_model_compute=True,
-                        )
-                    for request in completed_requests:
-                        perf_state = self._cold_perf_load_started.pop(
-                            request.req_id,
-                            None,
-                        )
-                        if perf_state is None:
-                            continue
-                        request_started, token_count = perf_state
-                        serving_perf_log(
-                            logger,
-                            "worker_load_complete",
-                            started=request_started,
-                            req_id=request.req_id,
-                            tokens=token_count,
-                            layers=self.num_layers,
-                            finalize_ms=round(finalize_ms, 3),
-                            scope="layerwise_wall",
-                            includes_model_compute=True,
-                        )
+        self._complete_layerwise_retrieve_group(
+            wait_group,
+            layerwise_requests,
+            metadata,
+        )
 
         return
 
@@ -9800,7 +9783,10 @@ class LMCacheConnectorV1Impl:
             num_layers = len(getattr(self, "_latent_layer_names", []) or [])
         if num_layers <= 0:
             num_layers = len(getattr(self, "kv_caches", {}) or {})
-        return max(num_layers + 2, 2)
+        # Deferred P-node storers expose two suspension points per layer:
+        # pre-HCOM submission and post-HCOM completion/publication.
+        steps_per_layer = 2 if getattr(self, "_layerwise_prefill_p_node", False) else 1
+        return max(steps_per_layer * num_layers + 2, 2)
 
     def _drain_layerwise_storer_fully(
         self,
@@ -13790,6 +13776,14 @@ class LMCacheConnectorV1Impl:
             getattr(connector_output, "finished_recving", None) or ()
         )
         for req_id in finished_recving:
+            attempts = getattr(self, "_checkpoint_restore_attempts", None)
+            attempt = attempts.pop(req_id, None) if attempts else None
+            if attempt is not None:
+                self._complete_checkpoint_restore_miss(req_id, attempt)
+                self.__dict__.setdefault("_checkpoint_restore_releases", []).append(
+                    (req_id, *attempt)
+                )
+                self._arm_preemption_controls()
             self._clear_request_marker(
                 "_dsa_group1_direct_hbm_active_req_id", req_id
             )
@@ -13812,6 +13806,22 @@ class LMCacheConnectorV1Impl:
                 if request_blocks.intersection(invalid_blocks):
                     cold_failed.add(req_id)
                     cold_loaded.discard(req_id)
+                    checkpoints = getattr(self, "_preemption_checkpoints", None)
+                    checkpoint = checkpoints.get(req_id) if checkpoints else None
+                    request = self._unfinished_requests.get(req_id) if checkpoint is not None else None
+                    if checkpoint is not None and request is not None and (
+                        checkpoint.capture.generation == request.num_preemptions
+                    ):
+                        # Repeated invalid-block reports must not consume the
+                        # bounded retry twice for the same failed read attempt.
+                        if request.kv_resume_checkpoint is not None:
+                            checkpoint.retry_shorter(
+                                self._lmcache_chunk_size,
+                                request.kv_resume_checkpoint[2],
+                            )
+                        request.kv_resume_checkpoint = None
+                        self._resume_lookup_queries.pop(req_id, None)
+                        self.lookup_client.clear_lookup_status(req_id)
             for req_id in finished_recving:
                 load_spec = self.load_specs.get(req_id)
                 request_blocks = validation_blocks.pop(req_id, None)
@@ -13842,11 +13852,33 @@ class LMCacheConnectorV1Impl:
                 // self._lmcache_chunk_size
                 * self._lmcache_chunk_size
             )
+            initial_cached_tokens = tracker.num_lmcache_cached_tokens
+            cold_full_hit = (
+                getattr(self, "_layerwise_prefill_p_node", False)
+                and initial_cached_tokens > 0
+                and initial_cached_tokens == tracker.prompt_len
+                and getattr(tracker, "sparse_remap_frontier", None) is not None
+            )
+            if cold_full_hit:
+                # Cold compact loading recomputes the final prompt token.
+                # Derive its initial release boundary from the original hit,
+                # not the live remap frontier (which advances during decode).
+                # This does not rewind the saved prefix or the save cursor.
+                initial_cached_tokens -= 1
+            initial_cached_end = (
+                initial_cached_tokens
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
             is_initial_frontier = (
                 window_size > 0 and committed_end == prefill_end
             )
             if window_size > 0 and tracker.decode_window_save_next_start is None:
-                if committed_end != prefill_end:
+                if committed_end != prefill_end and not (
+                    cold_full_hit
+                    and initial_cached_end > 0
+                    and committed_end == initial_cached_end
+                ):
                     logger.debug(
                         "Ignoring completion before the initial prefill "
                         "frontier: req_id=%s completed_end=%s expected=%s",
@@ -13862,11 +13894,6 @@ class LMCacheConnectorV1Impl:
                     f"LMCache committed_end={committed_end} exceeds request "
                     f"frontier={len(tracker.token_ids)} for request {req_id}."
                 )
-            initial_cached_end = (
-                tracker.num_lmcache_cached_tokens
-                // self._lmcache_chunk_size
-                * self._lmcache_chunk_size
-            )
             if (
                 window_size > 0
                 and initial_cached_end > 0
@@ -13877,6 +13904,8 @@ class LMCacheConnectorV1Impl:
                 # The first sparse step confirms that the externally loaded
                 # prefix can be released. It may arrive after decode-window
                 # tracking has already advanced to the full appended prompt.
+                # A chunk-aligned cold full hit also retains its final chunk
+                # for last-token recomputation, below the prompt save cursor.
                 tracker.decode_window_save_committed_end = max(
                     tracker.decode_window_save_committed_end,
                     committed_end,
