@@ -105,11 +105,17 @@ def test_lmcache_connector_patch_advertises_staged_sfa_sparse_load():
         ("unknown", False),
     ),
 )
-def test_dynamic_connector_advertises_staged_sparse_load_by_role(kv_role, expected):
+def test_dynamic_connector_advertises_staged_sparse_load_by_role(
+    kv_role, expected
+):
     pytest.importorskip("lmcache")
     pytest.importorskip("vllm")
-    connector_mod = pytest.importorskip("lmcache.integration.vllm.lmcache_connector_v1")
-    connector = object.__new__(connector_mod.LMCacheConnectorV1Dynamic)
+    connector_mod = pytest.importorskip(
+        "lmcache_ascend.integration.vllm.lmcache_ascend_connector_v1"
+    )
+    connector = object.__new__(
+        connector_mod.LMCacheAscendConnectorV1Dynamic
+    )
     connector._lmcache_engine = SimpleNamespace(
         use_layerwise=True,
         kv_role=kv_role,
@@ -206,7 +212,7 @@ def test_ascend_adapter_drains_pending_stores_for_async_producer():
     """Async non-consumer workers must drain pending stores before reuse."""
     pytest.importorskip("lmcache")
     pytest.importorskip("vllm")
-    adapter_mod = pytest.importorskip("lmcache.integration.vllm.vllm_v1_adapter")
+    adapter_mod = pytest.importorskip("lmcache_ascend.integration.vllm.vllm_v1_adapter")
 
     lmcache_engine = MagicMock()
     lmcache_engine.wait_for_pending_stores.return_value = {"req-1"}
@@ -221,7 +227,9 @@ def test_ascend_adapter_drains_pending_stores_for_async_producer():
     adapter.handle_preemptions(preempted_req_ids)
 
     lmcache_engine.wait_for_pending_stores.assert_called_once_with(preempted_req_ids)
-    lmcache_engine.drop_direct_store_states.assert_called_once_with(preempted_req_ids)
+    lmcache_engine.drop_direct_store_states.assert_called_once_with(
+        preempted_req_ids
+    )
 
 
 @pytest.mark.parametrize(

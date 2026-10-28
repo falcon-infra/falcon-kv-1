@@ -18,6 +18,7 @@ from lmcache.v1.npu_connector.npu_connectors import (
     VLLMPagedMemLayerwiseNPUConnector,
     VLLMPagedMemNPUConnectorV2,
 )
+from lmcache.v1.content_diagnostics import configure_npu_content_diagnostics
 
 logger = init_logger(__name__)
 
@@ -27,11 +28,11 @@ def CreateNPUConnector(
     metadata: LMCacheMetadata,
     engine: EngineType,
     layout_hints: Optional[LayoutHints] = None,
-) -> DeviceConnectorInterface:
+) -> GPUConnectorInterface:
     """Factory function to create NPU connectors on Ascend.
 
-    The factory selects native implementations without replacing imported
-    classes or modifying the process-wide torch device API.
+    Replaces upstream CreateGPUConnector to return Ascend NPU-specific
+    connector implementations.
     """
     use_gpu = need_gpu_interm_buffer(config)
     configure_npu_content_diagnostics(
@@ -39,25 +40,25 @@ def CreateNPUConnector(
     )
 
     num_gpus = torch.npu.device_count()
-    if num_gpus <= 0:
-        raise RuntimeError("An available Ascend NPU is required for KV transfer")
     local_rank = metadata.worker_id % num_gpus
-    from lmcache.inference_profile import validate_device_name
-
-    validate_device_name(torch.npu.get_device_name(local_rank))
     torch.npu.set_device(local_rank)
     device = torch.device(f"npu:{local_rank}")
 
     if engine == EngineType.VLLM:
-        pass  # Unsupported P4 branch removed.
+        if metadata.use_mla and config.use_layerwise and config.enable_blending:
+            raise ValueError(
+                "We haven't supported MLA with Cacheblend yet. Please disable blending."
+            )
 
         if config.use_layerwise:
-            conn = VLLMPagedMemLayerwiseNPUConnector.from_metadata(
-                metadata, use_gpu, device, layout_hints=layout_hints
-            )
-            conn.runtime_kv_group_layer_counts = getattr(
-                metadata, "runtime_kv_group_layer_counts", None
-            )
+            if config.enable_blending:
+                conn = VLLMBufferLayerwiseNPUConnector.from_metadata(
+                    metadata, use_gpu, device, layout_hints=layout_hints
+                )
+            else:
+                conn = VLLMPagedMemLayerwiseNPUConnector.from_metadata(
+                    metadata, use_gpu, device, layout_hints=layout_hints
+                )
             conn.dsa_two_groups = getattr(config, "dsa_two_groups", False)
             conn.enable_npu_transfer_validation = getattr(
                 config, "enable_npu_transfer_validation", True
@@ -74,5 +75,35 @@ def CreateNPUConnector(
             )
             conn.dsa_two_groups = getattr(config, "dsa_two_groups", False)
             return conn
+    elif engine == EngineType.SGLANG:
+        # First Party
+        from lmcache_ascend.v1.npu_connector.npu_connectors import (
+            SGLangLayerwiseNPUConnector,
+            SGLangNPUConnector,
+        )
+
+        num_layer, _, chunk_size, num_kv_head, head_dim = metadata.kv_shape
+        hidden_dim_size = num_kv_head * head_dim
+        kv_dtype = metadata.kv_dtype
+
+        if config.use_layerwise:
+            conn = SGLangLayerwiseNPUConnector(
+                hidden_dim_size,
+                num_layer,
+                use_gpu=use_gpu,
+                chunk_size=chunk_size,
+                dtype=kv_dtype,
+                device=device,
+            )
+        else:
+            conn = SGLangNPUConnector(
+                hidden_dim_size,
+                num_layer,
+                use_gpu=use_gpu,
+                chunk_size=chunk_size,
+                dtype=kv_dtype,
+                device=device,
+            )
+        return conn
     else:
         raise RuntimeError(f"Unsupported engine type for Ascend: {engine}")

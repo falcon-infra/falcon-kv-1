@@ -99,6 +99,7 @@ from lmcache.v1.serving_perf import (
     serving_perf_log,
     serving_perf_now,
 )
+from vllm_ascend.live_source_handoff import LIVE_SOURCE_EVENT_HANDOFF_KEY
 
 # Use LMCache's own math utilities instead of vllm's
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
@@ -1979,11 +1980,14 @@ def _prepare_remote_fill_persistent_placement(
 def _validate_remote_fill_sleep_mode(config: Any, vllm_config: Any) -> None:
     """Reject an allocator lifecycle that cannot yet drain armed writes."""
 
-    if getattr(config, "enable_remote_lmcache_store", False) and bool(
-        getattr(
-            getattr(vllm_config, "model_config", None),
-            "enable_sleep_mode",
-            False,
+    if (
+        getattr(config, "enable_remote_lmcache_store", False)
+        and bool(
+            getattr(
+                getattr(vllm_config, "model_config", None),
+                "enable_sleep_mode",
+                False,
+            )
         )
     ):
         raise ValueError(

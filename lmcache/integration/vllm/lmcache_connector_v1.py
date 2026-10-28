@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 import torch
 from lmcache.v1.device_connector.sparse import PreparedSparseSource
+from typing import Any
 
 if TYPE_CHECKING:
     # Third Party

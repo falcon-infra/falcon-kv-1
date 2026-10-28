@@ -47,6 +47,7 @@ from lmcache.v1.npu_connector.npu_connectors import (
 import lmcache.c_ops as lmc_ops
 import lmcache.v1.cache_engine as ascend_cache_engine
 import lmcache.v1.npu_connector.npu_connectors as npu_connectors
+from lmcache.v1.gpu_connector.sparse import PreparedSparseSource, PreparedSparseSourceLayer, build_prepared_sparse_source
 
 
 def test_layer_page_source_selects_requested_layer_and_suffix() -> None:
@@ -149,7 +150,7 @@ def test_layer_page_pointer_resolution_validates_registered_span(monkeypatch) ->
 def test_ascend_shared_page_metadata_allocates_full_and_tail_pages(
     kv_group, width, fmt
 ) -> None:
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
     engine.gpu_connector = SimpleNamespace(
         get_shape=lambda tokens, kv_group=None: torch.Size([tokens * width])
     )
@@ -302,7 +303,7 @@ def test_direct_page_token_widths_preserve_plane_order() -> None:
 
 def test_direct_store_preflight_checks_each_group_layout_once() -> None:
     calls = []
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
     engine.gpu_connector = SimpleNamespace(
         direct_page_layout_supported=lambda caches, group: (
             calls.append((caches, group)) or True
@@ -397,7 +398,8 @@ def test_direct_page_destination_planner_honors_disable(monkeypatch) -> None:
     monkeypatch.setattr(npu_connectors, "_DENSE_DIRECT_LOAD_DISABLE", True)
 
     assert (
-        connector.plan_direct_page_destinations([], torch.tensor([]), [], [], 1) is None
+        connector.plan_direct_page_destinations([], torch.tensor([]), [], [], 1)
+        is None
     )
 
 
@@ -643,7 +645,7 @@ def test_direct_retry_rejects_unverified_gap_before_window() -> None:
         submitted_end={0: 6},
         committed_end={0: 0},
     )
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
     engine._direct_store_states = {"request": state}
     engine._pending_store_reqs = {"request": 1}
     engine._direct_completed_futures = WeakSet()
@@ -670,7 +672,7 @@ def test_direct_retry_rejects_unverified_gap_before_window() -> None:
 
 
 def test_completed_layerwise_store_seeds_direct_progress() -> None:
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(chunk_size=2)
     engine._direct_store_states = {}
     result = LayerwiseStoreResult(
@@ -704,7 +706,7 @@ def test_adopted_layerwise_prefix_skips_direct_rehash() -> None:
         def process_tokens_from_prefix(self, *args, **kwargs):
             raise AssertionError("completed prefix must not be rehashed")
 
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(chunk_size=2)
     engine.token_database = _TokenDatabase()
     state = ascend_cache_engine._DirectStoreRequestState(
@@ -712,13 +714,15 @@ def test_adopted_layerwise_prefix_skips_direct_rehash() -> None:
         committed_end={0: 4, 1: 4},
     )
 
-    plans = engine._direct_suffix_plans(state, [1, 2, 3, 4], (0, 1), None)
+    plans = engine._direct_suffix_plans(
+        state, [1, 2, 3, 4], (0, 1), None
+    )
 
     assert plans == {0: [], 1: []}
 
 
 def test_completed_layerwise_groups_require_matching_hash_frontier() -> None:
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(chunk_size=2)
     engine._direct_store_states = {}
 
@@ -782,7 +786,9 @@ def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
             yield (
                 prefix_token_count,
                 len(tokens),
-                CacheEngineKey("model", 1, 0, 33, torch.float16, kv_group=kv_group),
+                CacheEngineKey(
+                    "model", 1, 0, 33, torch.float16, kv_group=kv_group
+                ),
             )
 
     class _StorageManager:
@@ -813,7 +819,7 @@ def test_direct_prefill_reuses_hashes_and_submits_both_groups_once(
             )
 
     monkeypatch.setattr(torch.npu, "Event", _Event)
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
     engine._direct_store_enabled = True
     engine._direct_store_states = {}
     engine._direct_store_jobs = deque()
@@ -942,7 +948,9 @@ def test_direct_tail_uses_one_merged_partial_page_per_group(monkeypatch) -> None
     class _TokenDatabase:
         @staticmethod
         def _key(value, group):
-            return CacheEngineKey("model", 1, 0, value, torch.float16, kv_group=group)
+            return CacheEngineKey(
+                "model", 1, 0, value, torch.float16, kv_group=group
+            )
 
         def process_tokens_from_prefix(self, tokens, prefix_token_count, **kwargs):
             yield prefix_token_count, len(tokens), self._key(33, 0)
@@ -966,7 +974,7 @@ def test_direct_tail_uses_one_merged_partial_page_per_group(monkeypatch) -> None
             return future
 
     monkeypatch.setattr(torch.npu, "Event", _Event)
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
     engine.num_layers = 2
     engine._live_source_builders = {}
     engine._completed_live_sources = {}
@@ -1048,8 +1056,8 @@ def test_direct_tail_uses_one_merged_partial_page_per_group(monkeypatch) -> None
     assert len(engine.storage_manager.submissions) == 1
     assert engine.direct_store_committed_ends("existing") == {0: 5}
 
-    engine._direct_store_states["mixed"] = ascend_cache_engine._DirectStoreRequestState(
-        planned_end=4, planned_hash=22
+    engine._direct_store_states["mixed"] = (
+        ascend_cache_engine._DirectStoreRequestState(planned_end=4, planned_hash=22)
     )
     assert engine._submit_direct_tail(
         "mixed",
@@ -1086,7 +1094,7 @@ def test_direct_prefill_skips_disabled_unfull_tail() -> None:
         def plan_direct_page_sources(*args, **kwargs):
             raise AssertionError("unaligned tail must not be planned")
 
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
     engine._direct_store_enabled = True
     engine._direct_store_states = {}
     engine._direct_store_jobs = deque()
@@ -1169,7 +1177,7 @@ def test_direct_prefill_rejects_missing_prefix_before_window() -> None:
         def plan_direct_page_sources(*args, **kwargs):
             raise AssertionError("unaddressable prefix must fail before planning")
 
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
     engine._direct_store_enabled = True
     engine._direct_store_states = {}
     engine.config = SimpleNamespace(chunk_size=2)
@@ -1211,7 +1219,7 @@ def test_direct_prefill_checks_chunk_crossing_unaligned_verified_prefix() -> Non
         def plan_direct_page_sources(*args, **kwargs):
             raise AssertionError("crossing missing page is outside the save window")
 
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
     engine._direct_store_enabled = True
     engine._direct_store_states = {}
     engine.config = SimpleNamespace(chunk_size=2)
@@ -1231,7 +1239,7 @@ def test_direct_prefill_checks_chunk_crossing_unaligned_verified_prefix() -> Non
 
 
 def test_direct_cpu_fallback_rejects_unaddressable_prefix() -> None:
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
 
     with pytest.raises(RuntimeError, match="CPU fallback cannot address"):
         engine._store_direct_cpu_group(
@@ -1247,7 +1255,7 @@ def test_direct_cpu_fallback_rejects_unaddressable_prefix() -> None:
 
 
 def test_direct_cpu_fallback_uses_all_layer_transfer() -> None:
-    engine = object.__new__(LMCacheEngine)
+    engine = object.__new__(AscendLMCacheEngine)
     calls = []
 
     def store_layer(_tokens, **kwargs):
@@ -1284,15 +1292,10 @@ def _make_layer_page_sources():
         for _ in range(2)
     ]
     assert pages is not None and all(obj is not None for obj in suffix)
-    return (
-        allocator,
-        pages,
-        suffix,
-        [
-            LayerPageSource(tuple(pages), layer_id, (suffix[layer_id],))
-            for layer_id in range(2)
-        ],
-    )
+    return allocator, pages, suffix, [
+        LayerPageSource(tuple(pages), layer_id, (suffix[layer_id],))
+        for layer_id in range(2)
+    ]
 
 
 def test_group_pointer_append_resolves_layer_pages_once(monkeypatch) -> None:
@@ -1349,7 +1352,9 @@ def test_group_pointer_append_resolves_full_and_tail_pages_once(monkeypatch) -> 
         full_tokens=2,
     )
     assert pages is not None
-    sources = [LayerPageSource(tuple(pages), layer_id) for layer_id in range(2)]
+    sources = [
+        LayerPageSource(tuple(pages), layer_id) for layer_id in range(2)
+    ]
     connector = _make_sparse_pack_connector()
     connector.num_layers = 2
     calls = []
@@ -1357,7 +1362,8 @@ def test_group_pointer_append_resolves_full_and_tail_pages_once(monkeypatch) -> 
         connector,
         "_resolve_registered_cpu_source_device_ptr",
         lambda page, *, layer_id, chunk_index, required_bytes, **_kwargs: (
-            calls.append((page, layer_id, chunk_index, required_bytes)) or page.data_ptr
+            calls.append((page, layer_id, chunk_index, required_bytes))
+            or page.data_ptr
         ),
     )
 
@@ -1369,7 +1375,8 @@ def test_group_pointer_append_resolves_full_and_tail_pages_once(monkeypatch) -> 
         for chunk_index, page in enumerate(pages)
     ]
     assert host_rows == [
-        [page.layer_data_ptr(layer_id) for page in pages] for layer_id in range(2)
+        [page.layer_data_ptr(layer_id) for page in pages]
+        for layer_id in range(2)
     ]
     for page in pages:
         page.ref_count_down()
@@ -1433,7 +1440,9 @@ def test_group_pointer_append_validates_complete_page_span(monkeypatch) -> None:
 
     connector.append_sparse_chunk_ptr_cache_for_layers(sources, [], [])
 
-    assert calls[: len(pages)] == [(page.data_ptr, page.get_size()) for page in pages]
+    assert calls[: len(pages)] == [
+        (page.data_ptr, page.get_size()) for page in pages
+    ]
     for obj in [*pages, *suffix]:
         obj.ref_count_down()
 
@@ -1445,17 +1454,16 @@ def test_group_pointer_append_falls_back_for_legacy_rows(monkeypatch) -> None:
     monkeypatch.setattr(
         connector,
         "_resolve_registered_cpu_source_device_ptr",
-        lambda source_obj, *, layer_id, chunk_index, **_kwargs: (
-            calls.append((source_obj, layer_id, chunk_index))
-            or 100 * layer_id + chunk_index
-        ),
+        lambda source_obj, *, layer_id, chunk_index, **_kwargs: calls.append(
+            (source_obj, layer_id, chunk_index)
+        )
+        or 100 * layer_id
+        + chunk_index,
     )
     rows = [[object(), object()], [object(), object()]]
     host_rows = []
 
-    connector.append_sparse_chunk_ptr_cache_for_layers(
-        rows, host_rows, None, kv_group=0
-    )
+    connector.append_sparse_chunk_ptr_cache_for_layers(rows, host_rows, None)
 
     assert host_rows == [[0, 1], [100, 101]]
     assert len(calls) == 4
@@ -2307,11 +2315,13 @@ def test_sparse_transfer_topk_preserves_implicit_dense_bootstrap(
         normalized,
         0,
     )
-    limited_slots, limited_selected = connector._maybe_limit_sparse_transfer_inputs(
-        packed_slots,
-        packed_selected,
-        has_explicit_sparse_selection=has_explicit_selection,
-        selected_token_counts=None,
+    limited_slots, limited_selected = (
+        connector._maybe_limit_sparse_transfer_inputs(
+            packed_slots,
+            packed_selected,
+            has_explicit_sparse_selection=has_explicit_selection,
+            selected_token_counts=None,
+        )
     )
 
     assert has_explicit_selection is False
@@ -2336,11 +2346,13 @@ def test_sparse_transfer_topk_limits_only_simple_explicit_selection(
         normalized,
         0,
     )
-    limited_slots, limited_selected = connector._maybe_limit_sparse_transfer_inputs(
-        packed_slots,
-        packed_selected,
-        has_explicit_sparse_selection=has_explicit_selection,
-        selected_token_counts=None,
+    limited_slots, limited_selected = (
+        connector._maybe_limit_sparse_transfer_inputs(
+            packed_slots,
+            packed_selected,
+            has_explicit_sparse_selection=has_explicit_selection,
+            selected_token_counts=None,
+        )
     )
 
     assert has_explicit_selection is True
@@ -2368,11 +2380,13 @@ def test_sparse_transfer_topk_preserves_target_mapped_selection_counts(
             selected_counts,
         )
     )
-    limited_slots, limited_selected = connector._maybe_limit_sparse_transfer_inputs(
-        packed_slots,
-        packed_selected,
-        has_explicit_sparse_selection=has_explicit_selection,
-        selected_token_counts=packed_counts,
+    limited_slots, limited_selected = (
+        connector._maybe_limit_sparse_transfer_inputs(
+            packed_slots,
+            packed_selected,
+            has_explicit_sparse_selection=has_explicit_selection,
+            selected_token_counts=packed_counts,
+        )
     )
 
     assert has_explicit_selection is True
@@ -2463,8 +2477,8 @@ def test_sparse_direct_explicit_payload_uses_fast_path(monkeypatch) -> None:
         def wait_event(self, event):
             pass
 
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _Stream())
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: _Stream())
+    monkeypatch.setattr(torch.npu, "stream", lambda stream: nullcontext())
 
     class _TensorLike:
         def __init__(self, numel: int):
@@ -2742,13 +2756,12 @@ def test_sparse_head_token_wise_uses_cached_token_count(monkeypatch) -> None:
         kv_format = type("_Fmt", (), {"value": 0})()
         vllm_two_major = False
 
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _Stream())
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: _Stream())
     monkeypatch.setattr(
         connector,
         "initialize_kvcaches_ptr",
         lambda **kwargs: None,
     )
-
     def _lazy_initialize_buffer(kvcaches, kv_group=0, init_staging=False):
         assert kvcaches is request_kvcaches
         connector.kvcaches = [(object(),)]
@@ -2847,7 +2860,7 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
             self.tensor_reads += 1
             return self._tensor
 
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _Stream())
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: _Stream())
     monkeypatch.setattr(
         connector,
         "initialize_kvcaches_ptr",
@@ -2937,7 +2950,9 @@ def test_sparse_head_token_wise_sees_late_cached_tensors(monkeypatch) -> None:
         kv_group=0,
     )
     next(pointer_gen)
-    pointer_gen.send(([pointer_objs[-1]], torch.arange(4, dtype=torch.int32), 0))
+    pointer_gen.send(
+        ([pointer_objs[-1]], torch.arange(4, dtype=torch.int32), 0)
+    )
 
     assert [obj.tensor_reads for obj in pointer_objs] == [1, 0]
     assert resolve_calls[-1][3] == 2
@@ -3101,9 +3116,7 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
     assert all("chunk_size" not in call for call in plan_calls)
     assert len(transfer_calls) == 2
     assert all(call["plan"] is destination_plan for call in transfer_calls)
-    assert all(
-        call["chunk_ptrs_npu"] is source_layer.chunk_ptrs_npu for call in transfer_calls
-    )
+    assert all(call["chunk_ptrs_npu"] is source_layer.chunk_ptrs_npu for call in transfer_calls)
     assert all(
         "load_stream" not in call and "current_stream" not in call
         for call in transfer_calls
@@ -3126,7 +3139,9 @@ def test_prepared_sparse_head_token_wise_skips_layer_lookups(monkeypatch) -> Non
             "payload_event": object(),
         }
     )
-    assert [event for event, _ in perf_events] == ["prepared_sparse_submit_summary"]
+    assert [event for event, _ in perf_events] == [
+        "prepared_sparse_submit_summary"
+    ]
     assert perf_events[0][1]["sum_ms"] >= perf_events[0][1]["max_ms"] >= 0
     slow_generator.close()
 
@@ -3155,8 +3170,8 @@ def test_prepared_sparse_group0_registers_request_source_probe(
     connector._sparse_lmc_host_interleaved = lambda _group: False
     connector._get_or_create_sparse_destination_plan = lambda **_kwargs: object()
     operation_order = []
-    connector._run_prepared_sparse_direct_kv_transfer_layer = lambda **_kwargs: (
-        operation_order.append("transfer")
+    connector._run_prepared_sparse_direct_kv_transfer_layer = (
+        lambda **_kwargs: operation_order.append("transfer")
     )
 
     source_tensor = torch.arange(12, dtype=torch.bfloat16)
@@ -3274,7 +3289,9 @@ def test_prepared_chunk_validation_is_reused_safely(
     connector._sparse_lmc_host_interleaved = lambda group: False
     connector._get_or_create_sparse_destination_plan = MagicMock()
     monkeypatch.setattr(npu_connectors, "serving_perf_enabled", lambda: False)
-    monkeypatch.setattr(npu_connectors, "serving_perf_detailed_enabled", lambda: False)
+    monkeypatch.setattr(
+        npu_connectors, "serving_perf_detailed_enabled", lambda: False
+    )
     monkeypatch.setattr(
         npu_connectors, "npu_content_diagnostics_enabled", lambda: False
     )
@@ -3428,7 +3445,7 @@ def test_prepared_sparse_launch_avoids_load_stream_handoff(
     def fail_stream_context(_stream):
         raise AssertionError("prepared sparse launch entered a load stream")
 
-    monkeypatch.setattr(torch.cuda, "stream", fail_stream_context)
+    monkeypatch.setattr(torch.npu, "stream", fail_stream_context)
     monkeypatch.setattr(
         npu_connectors,
         "sparse_mla_dsa_batched_direct_kv_transfer_prepared",
@@ -3496,7 +3513,7 @@ def test_deferred_sparse_consumer_wait_joins_after_all_submissions(
         ),
         raising=False,
     )
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(torch.npu, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(
         npu_connectors,
         "sparse_mla_dsa_batched_direct_kv_transfer_fast",
@@ -3822,8 +3839,8 @@ def _staging_batched_to_gpu(
     )
 
     monkeypatch.setattr(npu_connectors, "_DENSE_DIRECT_LOAD_DISABLE", True)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _NoopStream())
-    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: _NoopStream())
+    monkeypatch.setattr(torch.npu, "stream", lambda _stream: nullcontext())
     monkeypatch.setattr(connector, "initialize_kvcaches_ptr", lambda **_kwargs: None)
     monkeypatch.setattr(
         connector,
@@ -3904,7 +3921,7 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     connector.load_stream = _NoopStream()
 
     monkeypatch.setattr(npu_connectors, "_DENSE_DIRECT_LOAD_DISABLE", False)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _NoopStream())
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: _NoopStream())
     monkeypatch.setattr(
         connector,
         "initialize_kvcaches_ptr",
@@ -4035,7 +4052,9 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
     assert init_staging_values == [False]
     assert len(slot_device_calls) == 1
     assert slot_device_calls[0][1] is connector.load_stream
-    assert torch.equal(slot_device_calls[0][0], torch.arange(273, dtype=torch.long))
+    assert torch.equal(
+        slot_device_calls[0][0], torch.arange(273, dtype=torch.long)
+    )
     assert len(pointer_calls) == 1
     assert pointer_calls[0][2] is cached_chunk_ptrs_npu
     assert len(pointer_calls[0][1]) == 1
@@ -4072,7 +4091,7 @@ def test_dense_batched_to_gpu_direct_path_skips_staging(monkeypatch) -> None:
 
     producer_stream = _TrackingStream("producer")
     connector.load_stream = _TrackingStream("load")
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: producer_stream)
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: producer_stream)
     readiness = object()
     record = MagicMock(return_value=readiness)
     monkeypatch.setattr(connector, "record_dense_load_readiness", record)
@@ -4115,7 +4134,7 @@ def test_dense_batched_to_gpu_direct_path_passes_variable_chunk_metadata(
     connector.load_stream = _NoopStream()
 
     monkeypatch.setattr(npu_connectors, "_DENSE_DIRECT_LOAD_DISABLE", False)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _NoopStream())
+    monkeypatch.setattr(torch.npu, "current_stream", lambda: _NoopStream())
     monkeypatch.setattr(connector, "initialize_kvcaches_ptr", lambda **kwargs: None)
     monkeypatch.setattr(
         connector,
