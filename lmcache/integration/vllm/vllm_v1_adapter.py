@@ -102,6 +102,7 @@ from lmcache.v1.serving_perf import (
 )
 from vllm_ascend.live_source_handoff import LIVE_SOURCE_EVENT_HANDOFF_KEY
 from lmcache.v1.indexer_c8 import IndexerC8Layout
+from lmcache.v1.serving_perf import prefill_reuse_debug_enabled, prefill_reuse_debug_log, prefill_start_timing_enabled, prefill_start_timing_log, serving_perf_enabled, serving_perf_log, serving_perf_now
 
 # Use LMCache's own math utilities instead of vllm's
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
@@ -8530,6 +8531,7 @@ class LMCacheConnectorV1Impl:
                     retrieve_state = self._worker_retrieve_state.get(
                         request.req_id
                     )
+                    retrieve_state_is_new = retrieve_state is None
                     if retrieve_state is None:
                         retrieve_state = WorkerRetrieveState(req_id=request.req_id)
                     dsa_two_groups = self._is_dsa_two_groups()
@@ -8558,6 +8560,7 @@ class LMCacheConnectorV1Impl:
                             retain_dense_seed=retain_dense_seed,
                             dsa_two_groups=dsa_two_groups,
                             token_count=len(retrieve_tokens),
+                            state_is_new=retrieve_state_is_new,
                         )
                     )
                     dense_preflight_state: dict[str, Any] = {}
@@ -15376,6 +15379,7 @@ class LMCacheConnectorV1Impl:
         retain_dense_seed: bool,
         dsa_two_groups: bool,
         token_count: int,
+        state_is_new: bool = False,
     ) -> tuple[WorkerRetrieveState, bool]:
         """Keep P-prefill sources for the engine's validated suffix adoption."""
         reuse_prefix = bool(
@@ -15396,6 +15400,27 @@ class LMCacheConnectorV1Impl:
             and not request.resumed_from_preemption
             and state.token_count <= token_count
         )
+        rank = int(
+            getattr(getattr(self.lmcache_engine, "metadata", None), "worker_id", -1)
+        )
+        debug_reuse = prefill_reuse_debug_enabled(rank)
+        action = "new" if state_is_new else "keep"
+        if debug_reuse:
+            old_tokens = state.token_count
+            if preserve:
+                reason = "ok"
+            elif not reuse_prefix:
+                reason = "path"
+            elif state.req_id != request.req_id:
+                reason = "req"
+            elif request.resumed_from_preemption:
+                reason = "preempt"
+            elif state.dense_prefix_generation is None:
+                reason = "new"
+            elif state.dense_prefix_generation != generation:
+                reason = "gen"
+            else:
+                reason = "shrink"
         if retain_dense_seed and not preserve and (
             state.shared_request_active
             or state.dense_prefix_seed
@@ -15404,11 +15429,30 @@ class LMCacheConnectorV1Impl:
         ):
             self._release_shared_worker_retrieve_state(state, self.lmcache_engine)
             state = WorkerRetrieveState(req_id=request.req_id)
+            action = "reset"
         if reuse_prefix:
             # The engine still consumes and validates every shared envelope.
             # It preserves unchanged objects and replaces a growing partial
             # tail before appending new chunks; DMA bank bindings stay separate.
             state.dense_prefix_generation = generation
+        if debug_reuse:
+            keep_mapping = bool(
+                getattr(self, "_layerwise_prefill_p_node", False)
+                and getattr(self, "_layerwise_prefill_dma", False)
+                and getattr(self, "_deferred_layerwise_prefill_load_active", False)
+                and not getattr(self, "enable_blending", False)
+            )
+            prefill_reuse_debug_log(
+                rank,
+                "state",
+                req_id=request.req_id,
+                p=token_count,
+                a=action,
+                w=reason,
+                old=old_tokens,
+                map="keep" if keep_mapping else "h2d",
+                e=reuse_prefix,
+            )
         return state, reuse_prefix
 
     def _dense_retrieve_slot_mapping(self, slot_mapping: torch.Tensor) -> torch.Tensor:
