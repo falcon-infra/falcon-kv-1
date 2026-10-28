@@ -108,6 +108,7 @@ from lmcache.v1.prefill_metadata import PrefillMetadataCache
 from functools import partial
 from vllm_ascend import envs
 from lmcache.v1.npu_connector.prefill_overlap import AclEventTimer, PrefillOverlapRecorder, single_request_span
+from lmcache.v1.npu_connector.prefill_overlap import AclEventTimer, PrefillOverlapRecorder, request_spans
 
 # Use LMCache's own math utilities instead of vllm's
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
@@ -13198,7 +13199,7 @@ class LMCacheConnectorV1Impl:
         if recorder is not None:
             requests = self._parent._get_connector_metadata().requests
             recorder.begin_step(
-                single_request_span(requests, forward_context.attn_metadata)
+                request_spans(requests, forward_context.attn_metadata)
             )
             self._prefill_overlap_step_active = recorder.active is not None
             self.lmcache_engine.gpu_connector.prefill_overlap_recorder = (
