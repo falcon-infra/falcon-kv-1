@@ -5631,6 +5631,12 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                         )
                     with torch.npu.stream(bank_stream):
                         deferred_load_submitted = True
+                        overlap = getattr(self, "prefill_overlap_recorder", None)
+                        overlap_dma = (
+                            overlap.start_interval(
+                                "load", bank_stream, kv_group, bank, layer_id,
+                            ) if overlap is not None else None
+                        )
                         if diagnose_bank_load:
                             native_enqueue_started = time.perf_counter()
                         if prefill_packet:
@@ -5639,6 +5645,8 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                             )
                         else:
                             lmc_ops.layerwise_prefill_dma_copy(copies, False)
+                        if overlap is not None:
+                            overlap.end_interval(overlap_dma, bank_stream)
                         if diagnose_bank_load:
                             native_enqueue_ms = (
                                 time.perf_counter() - native_enqueue_started
@@ -7331,6 +7339,12 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                     with torch.npu.stream(bank_stream):
                         # The final-access event is already ahead of us on
                         # the bank FIFO; do not wait for later compute here.
+                        overlap = getattr(self, "prefill_overlap_recorder", None)
+                        overlap_dma = (
+                            overlap.start_interval(
+                                "save", bank_stream, kv_group, bank, layer_id,
+                            ) if overlap is not None else None
+                        )
                         if prefill_packet:
                             self._submit_prefill_c8_packet(
                                 prefill_packets, layer_id, bank, bank_stream, True,
@@ -7339,6 +7353,8 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                             lmc_ops.layerwise_prefill_dma_copy(
                                 deferred_dma_copies[layer_id], True
                             )
+                        if overlap is not None:
+                            overlap.end_interval(overlap_dma, bank_stream)
                 elif dense_direct or layout.indexer_c8:
                     staged_views = None
                     if deferred_layerwise_put:
@@ -7713,6 +7729,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         layer_id: int,
         kv_group: int,
         bank_offset: Optional[int] = None,
+        model_layer_id: Optional[int] = None,
     ) -> None:
         """Order a layer consumer after its asynchronous P-node bank hand-off.
 
@@ -7757,6 +7774,12 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             device_wait_start = torch.npu.Event(enable_timing=True)
             device_wait_end = torch.npu.Event(enable_timing=True)
             device_wait_start.record(current_stream)
+        overlap = getattr(self, "prefill_overlap_recorder", None)
+        overlap_wait = (
+            overlap.start_interval(
+                "wait", current_stream, kv_group, bank, layer_id, model_layer_id,
+            ) if overlap is not None else None
+        )
         load_records: list[tuple[int, Any]] = []
         # Raw DMA records are keyed by physical bank.  Waiting on every bank
         # used by the current batch is required when requests are at different
@@ -7786,6 +7809,8 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                 if previous_tail is None or previous_tail[0] != generation:
                     continue
                 current_stream.wait_event(previous_tail[1])
+        if overlap is not None:
+            overlap.end_interval(overlap_wait, current_stream)
         if diagnose_first_bank:
             device_wait_end.record(current_stream)
             fields = dict(

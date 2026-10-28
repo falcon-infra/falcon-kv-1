@@ -105,6 +105,9 @@ from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.serving_perf import prefill_reuse_debug_enabled, prefill_reuse_debug_log, prefill_start_timing_enabled, prefill_start_timing_log, serving_perf_enabled, serving_perf_log, serving_perf_now
 from copy import deepcopy
 from lmcache.v1.prefill_metadata import PrefillMetadataCache
+from functools import partial
+from vllm_ascend import envs
+from lmcache.v1.npu_connector.prefill_overlap import AclEventTimer, PrefillOverlapRecorder, single_request_span
 
 # Use LMCache's own math utilities instead of vllm's
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
@@ -10451,6 +10454,19 @@ class LMCacheConnectorV1Impl:
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
+        """Seal timing events after all ordinary bank submissions."""
+        recorder = getattr(self, "_prefill_overlap_recorder", None)
+        try:
+            self._wait_for_save_without_overlap()
+        except BaseException:
+            if recorder is not None:
+                recorder.finish_step("incomplete")
+            raise
+        else:
+            if recorder is not None:
+                recorder.finish_step()
+
+    def _wait_for_save_without_overlap(self):
         """Block until this step's KV saves reach the connector boundary."""
 
         save_context: dict[str, Any] = {}
@@ -11854,6 +11870,17 @@ class LMCacheConnectorV1Impl:
             live_source_requested=live_source_requested,
             layerwise_prefill_dma=getattr(self, "_layerwise_prefill_dma", False),
         )
+        if (
+            metadata is not None
+            and getattr(self, "_prefill_overlap_enabled", False)
+            and not is_sparse_decode
+        ):
+            request = self._unfinished_requests.get(tracker.req_id)
+            if request is not None:
+                start = int(request.num_computed_tokens)
+                end = min(len(tracker.token_ids), int(tracker.prompt_len))
+                if start < end:
+                    metadata.prefill_overlap_span = (start, end)
         return metadata
 
     def _add_decode_window_save_metas(
@@ -13076,6 +13103,35 @@ class LMCacheConnectorV1Impl:
             )
         )
         self._defer_prepared_sparse_setup = self._prepare_cold_graph_pointers
+        self._prefill_overlap_enabled = bool(
+            getattr(self, "_layerwise_prefill_p_node", False)
+            or os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+            .strip()
+            .lower()
+            == "true"
+        ) and os.getenv("VLLM_ASCEND_PREFILL_OVERLAP_STATS", "false").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._prefill_overlap_recorder = None
+        self._prefill_overlap_step_active = False
+        if self._prefill_overlap_enabled and role == KVConnectorRole.WORKER:
+            device = torch.npu.current_device()
+            self._prefill_overlap_recorder = PrefillOverlapRecorder(
+                partial(torch.npu.Event, enable_timing=True),
+                logger.info,
+                elapsed_time=AclEventTimer(),
+                worker=dict(
+                    tp_rank=get_tensor_model_parallel_rank(),
+                    dp_rank=int(vllm_config.parallel_config.data_parallel_index),
+                ),
+                initialize_thread=partial(torch.npu.set_device, device),
+            )
+            self.lmcache_engine.gpu_connector.prefill_overlap_recorder = (
+                self._prefill_overlap_recorder
+            )
 
     def configure_live_latent_source(self, enabled: bool) -> None:
         """Apply the two-sided hybrid-transport capability decision."""
@@ -13110,20 +13166,35 @@ class LMCacheConnectorV1Impl:
     ) -> None:
         """Start loads and arm a real producer-event handoff when required."""
 
-        if getattr(self, "_force_layerwise_prefill_store", False):
-            self.lmcache_engine.poll_layerwise_prefill_puts()
-        if (
-            getattr(self, "_force_layerwise_prefill_store", False)
-            and self._remote_store_requested
-            and forward_context.attn_metadata is not None
-        ):
-            # Do this before the common path primes storers and cache keys.
-            for request in self._parent._get_connector_metadata().requests:
-                _prepare_remote_fill_persistent_placement(
-                    request.request_configs,
-                    group1_direct_hbm=_persistent_direct_hbm_enabled(self.config),
-                )
-        self._common_start_load_kv(forward_context, **kwargs)
+        recorder = getattr(self, "_prefill_overlap_recorder", None)
+        if recorder is not None:
+            requests = self._parent._get_connector_metadata().requests
+            recorder.begin_step(
+                single_request_span(requests, forward_context.attn_metadata)
+            )
+            self._prefill_overlap_step_active = recorder.active is not None
+            self.lmcache_engine.gpu_connector.prefill_overlap_recorder = (
+                recorder if self._prefill_overlap_step_active else None
+            )
+        try:
+            if getattr(self, "_force_layerwise_prefill_store", False):
+                self.lmcache_engine.poll_layerwise_prefill_puts()
+            if (
+                getattr(self, "_force_layerwise_prefill_store", False)
+                and self._remote_store_requested
+                and forward_context.attn_metadata is not None
+            ):
+                # Do this before the common path primes storers and cache keys.
+                for request in self._parent._get_connector_metadata().requests:
+                    _prepare_remote_fill_persistent_placement(
+                        request.request_configs,
+                        group1_direct_hbm=_persistent_direct_hbm_enabled(self.config),
+                    )
+            self._common_start_load_kv(forward_context, **kwargs)
+        except BaseException:
+            if recorder is not None:
+                recorder.finish_step("incomplete")
+            raise
         if forward_context.attn_metadata is None or not self.config.dsa_two_groups:
             return
         requests = self._direct_prefill_requests() or []
