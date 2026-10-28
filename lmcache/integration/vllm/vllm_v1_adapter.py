@@ -100,6 +100,7 @@ from lmcache.v1.serving_perf import (
     serving_perf_now,
 )
 from vllm_ascend.live_source_handoff import LIVE_SOURCE_EVENT_HANDOFF_KEY
+from lmcache.v1.indexer_c8 import IndexerC8Layout
 
 # Use LMCache's own math utilities instead of vllm's
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
@@ -11915,6 +11916,7 @@ class LMCacheConnectorV1Impl:
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
         parent: KVConnectorBase_V1,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
     ):
         self._parent = parent
         self._vllm_config = vllm_config
@@ -11932,9 +11934,45 @@ class LMCacheConnectorV1Impl:
             "LMCache v1 configuration is should be passed for vLLM v1."
         )
         self._apply_extra_config(config, vllm_config)
+        pipeline_parallel_size = vllm_config.parallel_config.pipeline_parallel_size
+        if config.dsa_two_groups and pipeline_parallel_size > 1:
+            raise ValueError(
+                "LMCache dsa_two_groups does not support pipeline parallelism; "
+                "pipeline_parallel_size must be 1, got "
+                f"{pipeline_parallel_size}."
+            )
+        runtime_group_layer_counts = self._derive_runtime_kv_group_layer_counts(
+            bool(config.dsa_two_groups),
+            kv_cache_config,
+        )
         self.config = config
+        if getattr(config, "decode_preemption_checkpoint", False):
+            self._validate_preemption_checkpoint_setup(config, vllm_config)
+        self._preemption_checkpoints: dict[str, PendingCheckpoint] = {}
+        self._checkpoint_snapshots: list[tuple] = []
+        self._checkpoint_cancels: list[tuple[str, int]] = []
 
-        service_factory = VllmServiceFactory(config, vllm_config, role.name.lower())
+        indexer_c8_layout = None
+        if runtime_group_layer_counts is not None:
+            indexer_spec = kv_cache_config.kv_cache_groups[1].kv_cache_spec
+            if getattr(indexer_spec, "cache_sparse_c8", False):
+                indexer_c8_layout = IndexerC8Layout(indexer_spec.sparse_head_dim[-1])
+
+        service_factory = VllmServiceFactory(
+            config,
+            vllm_config,
+            role.name.lower(),
+            runtime_kv_group_layer_counts=runtime_group_layer_counts,
+            indexer_c8_layout=indexer_c8_layout,
+            runtime_kv_group_layer_names=(
+                tuple(
+                    tuple(group.layer_names)
+                    for group in kv_cache_config.kv_cache_groups
+                )
+                if runtime_group_layer_counts is not None
+                else None
+            ),
+        )
         self._manager = LMCacheManager(config, service_factory, connector=self)
 
         # Start services managed by LMCacheManager
