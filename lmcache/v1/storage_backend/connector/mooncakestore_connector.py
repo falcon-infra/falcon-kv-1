@@ -246,6 +246,8 @@ class MooncakestoreConnector(RemoteConnector):
             )
         self._external_page_only = external_page_only
         self._lmcache_metadata = engine_metadata
+        indexer_layout = getattr(engine_metadata, "indexer_c8_layout", None)
+        self._mixed_indexer_layout = indexer_layout if indexer_layout is not None and indexer_layout.mixed else None
 
         # initialize base class, which includes some common attributes
         super().__init__(engine_config, engine_metadata)
@@ -439,6 +441,10 @@ class MooncakestoreConnector(RemoteConnector):
             self._page_num_layers = int(
                 getattr(engine_metadata, "kv_shape", (1,))[0]
             )
+            self._page_group_layer_counts = (
+                validate_two_group_layer_counts(engine_metadata.runtime_kv_group_layer_counts)
+                if engine_config.dsa_two_groups else None
+            )
             if getattr(self, "_page_first_multi_buffer", False):
                 if self.save_chunk_meta:
                     raise ValueError(
@@ -555,6 +561,14 @@ class MooncakestoreConnector(RemoteConnector):
         self,
         key: CacheEngineKey,
     ) -> tuple[list[torch.Size], list[torch.dtype], MemoryFormat, int]:
+        mixed = getattr(self, "_mixed_indexer_layout", None) if key.kv_group == 1 else None
+        if mixed is not None:
+            layers = (key.layer_id,) if isinstance(key, LayerCacheEngineKey) else range(len(mixed.c8_layers))
+            widths = [mixed.token_bytes_for(layer) for layer in layers]
+            return (
+                [torch.Size([self._lmcache_chunk_size() * width]) for width in widths],
+                [torch.uint8] * len(widths), MemoryFormat.KV_DSA_INDEX_FMT, sum(widths),
+            )
         token_dims = self._dsa_raw_token_dims.get(key.kv_group)
         if token_dims is None:
             return (
@@ -993,7 +1007,7 @@ class MooncakestoreConnector(RemoteConnector):
         if isinstance(memory_obj, LayerPageMemoryObj):
             if not isinstance(key, LayerCacheEngineKey):
                 raise ValueError("Layer page requires a layer cache key")
-            return memory_obj.layer_data_ptr(key.layer_id), memory_obj.layer_size
+            return memory_obj.layer_data_ptr(key.layer_id), memory_obj.layer_size_bytes(key.layer_id)
         return memory_obj.data_ptr, memory_obj.get_size()
 
     def _allocate_zero_copy_buffers(
@@ -1387,9 +1401,10 @@ class MooncakestoreConnector(RemoteConnector):
             raise ValueError("Layer-page retrieval requires unique chunk keys")
 
         first_key = base_keys[0]
+        page_num_layers = self._page_num_layers_for(first_key)
         first = self._metadata_for_raw_key(first_key)
         shapes, dtypes, fmt, _ = first
-        if len(shapes) != 1 or len(dtypes) != 1 or any(
+        if len(shapes) not in (1, page_num_layers) or len(dtypes) != len(shapes) or len(set(dtypes)) != 1 or any(
             key.kv_group != first_key.kv_group or key.dtype != first_key.dtype
             for key in base_keys[1:]
         ):
@@ -1402,7 +1417,7 @@ class MooncakestoreConnector(RemoteConnector):
             shapes,
             dtypes,
             len(page_keys),
-            self._page_num_layers,
+            page_num_layers,
             fmt,
             valid_tokens=[
                 mooncake_valid_tokens(key, self.local_cpu_backend.metadata.chunk_size)
@@ -1424,7 +1439,7 @@ class MooncakestoreConnector(RemoteConnector):
                     layout="layer_merged",
                     kv_group=int(first_key.kv_group),
                     kv_groups=[int(first_key.kv_group)],
-                    layers=self._page_num_layers,
+                    layers=page_num_layers,
                     pages=len(page_keys),
                     submitted_pages=0,
                     completed_pages=0,
@@ -1441,9 +1456,9 @@ class MooncakestoreConnector(RemoteConnector):
 
         try:
             setup_started = serving_perf_now() if perf_enabled else 0.0
-            sizes = [[page.layer_size] * self._page_num_layers for page in pages]
+            sizes = [[page.layer_size_bytes(i) for i in range(page_num_layers)] for page in pages]
             ptrs = [
-                [page.layer_data_ptr(layer) for layer in range(self._page_num_layers)]
+                [page.layer_data_ptr(layer) for layer in range(page_num_layers)]
                 for page in pages
             ]
             expected = [sum(page_sizes) for page_sizes in sizes]
@@ -1527,11 +1542,11 @@ class MooncakestoreConnector(RemoteConnector):
                     layout="layer_merged",
                     kv_group=int(first_key.kv_group),
                     kv_groups=[int(first_key.kv_group)],
-                    layers=self._page_num_layers,
+                    layers=page_num_layers,
                     pages=len(page_keys),
                     submitted_pages=len(page_keys),
                     completed_pages=len(page_keys) if status == "ok" else 0,
-                    buffers=len(page_keys) * self._page_num_layers,
+                    buffers=len(page_keys) * page_num_layers,
                     bytes=sum(expected),
                     metadata_ms=round(metadata_ms, 3),
                     allocation_ms=round(allocation_ms, 3),
@@ -2112,12 +2127,15 @@ class MooncakestoreConnector(RemoteConnector):
                     )
 
     @staticmethod
-    def _raw_layout_cache_key(key: CacheEngineKey) -> tuple:
-        return (
+    def _raw_layout_cache_key(self, key: CacheEngineKey) -> tuple:
+        base = (
             int(key.kv_group),
             key.dtype,
             key.tags,
         )
+        if key.kv_group == 1 and getattr(self, "_mixed_indexer_layout", None) is not None:
+            return (*base, key.layer_id if isinstance(key, LayerCacheEngineKey) else None)
+        return base
 
     def _external_page_key(
         self, key: CacheEngineKey, sizes: List[int]
@@ -2137,8 +2155,8 @@ class MooncakestoreConnector(RemoteConnector):
         expected = cache.get(cache_key)
         if expected is None:
             expected = self._metadata_for_raw_key(key)[3] * valid_tokens
-            if not layer_key:
-                expected *= self._page_num_layers
+            if not layer_key and not (key.kv_group == 1 and getattr(self, "_mixed_indexer_layout", None) is not None):
+                expected *= self._page_num_layers_for(key)
             cache[cache_key] = expected
         actual = sum(sizes)
         if actual != expected:
@@ -2149,7 +2167,7 @@ class MooncakestoreConnector(RemoteConnector):
         return (
             key.to_string()
             if layer_key
-            else mooncake_page_key(key, self._page_num_layers)
+            else mooncake_page_key(key, self._page_num_layers_for(key))
         )
 
     async def batched_put(
@@ -2614,6 +2632,7 @@ class MooncakestoreConnector(RemoteConnector):
         complete_groups, legacy_indices = self._complete_page_groups(keys)
         page_groups: list[tuple[str, list[int]]] = []
         for page_key, indices in complete_groups:
+            mixed = getattr(self, "_mixed_indexer_layout", None) if keys[indices[0]].kv_group == 1 else None
             valid_tokens = mooncake_valid_tokens(
                 keys[indices[0]], self.local_cpu_backend.metadata.chunk_size
             )
@@ -2622,7 +2641,7 @@ class MooncakestoreConnector(RemoteConnector):
             )
             if all(
                 self._zero_copy_buffer(keys[index], memory_objs[index])[1]
-                == expected_layer_bytes
+                == (mixed.layer_bytes(valid_tokens, keys[index].layer_id) if mixed is not None else expected_layer_bytes)
                 for index in indices
             ):
                 page_groups.append((page_key, indices))

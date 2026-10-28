@@ -1961,12 +1961,15 @@ class LMCacheEngine:
         self,
         memory_objs: list[list[MemoryObj]],
         keys_layer_major: list[list[CacheEngineKey]],
+        *,
+        kv_group: int = 0,
     ) -> Optional[SharedHandleBatch]:
         """Compact a homogeneous all-layer page-first result."""
         started = serving_perf_now() if serving_perf_enabled() else None
+        num_layers = self.num_layers_for_group(kv_group)
         if (
             getattr(self, "shared_cpu_cache_name", None) is None
-            or len(memory_objs) != self.num_layers
+            or len(memory_objs) != num_layers
             or not memory_objs
             or not memory_objs[0]
         ):
@@ -1974,7 +1977,7 @@ class LMCacheEngine:
         chunks = len(memory_objs[0])
         if (
             any(len(layer) != chunks for layer in memory_objs)
-            or len(keys_layer_major) != self.num_layers
+            or len(keys_layer_major) != num_layers
             or any(len(layer) != chunks for layer in keys_layer_major)
         ):
             return None
@@ -1983,7 +1986,7 @@ class LMCacheEngine:
             page = memory_objs[0][chunk]
             if not isinstance(page, LayerPageMemoryObj):
                 break
-            if page.num_layers != self.num_layers or any(
+            if page.layer_size is None or page.num_layers != num_layers or any(
                 layer[chunk] is not page for layer in memory_objs
             ):
                 return None
@@ -2009,7 +2012,7 @@ class LMCacheEngine:
         batch = SharedHandleBatch(
             shm_name=self.shared_cpu_cache_name,
             producer_rank=self.metadata.worker_id,
-            num_layers=self.num_layers,
+            num_layers=num_layers,
             num_chunks=chunks,
             physical_sizes=physical_sizes,
             chunk_hashes=[
@@ -2031,7 +2034,7 @@ class LMCacheEngine:
                 logger,
                 "shared_handle_batch_build",
                 started=started,
-                layers=self.num_layers,
+                layers=num_layers,
                 chunks=chunks,
                 offsets=len(batch.offsets),
                 pages=page_chunks,
@@ -8139,11 +8142,7 @@ class LMCacheEngine:
                 self.fmt = MemoryFormat.KV_T2D
         if metadata.use_mla:
             self.fmt = MemoryFormat.KV_MLA_LATENT_FMT
-        # DSA index KV-group shapes are registered by the vLLM adapter after
-        # the engine is constructed.  Run the capacity check from post_init,
-        # once all KV groups are available, but still before StorageManager
-        # allocates the shared-memory slab.
-        self._shared_cpu_sparse_capacity_sanity_pending = True
+        self._report_shared_cpu_sparse_capacity_sanity()
 
         # NOTE(ApostaC): we haven't support lookup-cache yet
         self.lookup_cache: dict[CacheEngineKey, Any] = {}
