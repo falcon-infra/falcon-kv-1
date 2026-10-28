@@ -74,6 +74,7 @@ class LMCacheMetadata:
     # Worker-local HBM addressing, deliberately excluded from payload identity.
     indexer_hbm_block_map: Optional[tuple[int, ...]] = field(default=None, repr=False)
 
+    mla_cache_tp_replicated: bool = False
     def is_first_rank(self) -> bool:
         """Check if the current worker is the first rank"""
         return self.worker_id == self.first_rank
