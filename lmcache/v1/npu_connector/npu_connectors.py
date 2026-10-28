@@ -1278,6 +1278,11 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
             .strip().lower() == "true"
         )
+        configured_bank_count = 2
+        if self._layerwise_prefill_dma:
+            from vllm.v1.core.dsa_shared_pool import layerwise_prefill_bank_count
+
+            configured_bank_count = layerwise_prefill_bank_count()
         self.load_stream_num = 4
         self.load_stream_list = [
             torch.npu.Stream() for __ in range(self.load_stream_num)
@@ -1352,7 +1357,10 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         # (when there is no load for the layer that is about to use it).
         # Keep the state per KV group: latent and indexer own independent
         # physical banks even though they share the connector streams.
-        self._layerwise_prefill_bank_counts: dict[int, int] = {}
+        self._layerwise_prefill_bank_counts: dict[int, int] = (
+            dict.fromkeys((0, 1), configured_bank_count)
+            if self._layerwise_prefill_dma else {}
+        )
         self._layerwise_prefill_transfer_generations: dict[int, int] = {}
         # Raw layerwise-prefill DMA uses one FIFO stream per physical bank and
         # KV group.  Save/load operations for a bank must share this stream:
@@ -5280,7 +5288,11 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             )
             layerwise_prefill_bank_offset = int(
                 kwargs.get("layerwise_prefill_bank_offset", 0) or 0
-            ) & 1
+            ) % layerwise_prefill_bank_count
+        if prefill_dma and (
+            len(kwargs["prefill_dma_block_ids_by_bank"]) != layerwise_prefill_bank_count
+        ):
+            raise ValueError("Prefill DMA bank maps disagree with the rotation depth")
         if deferred_dense_direct_get:
             self._set_layerwise_prefill_bank_count(
                 kv_group,
@@ -5390,10 +5402,14 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             )
             if plan_cache is not None:
                 reused_plans = sum(
-                    plan_cache[(kv_group, bank)].reused_chunks > 0 for bank in range(2)
+                    plan_cache[(kv_group, bank)].reused_chunks > 0
+                    for bank in range(len(dma_plans))
                 )
-                plan_mode = ("full", "mix", "reuse")[reused_plans]
-                for bank in range(2):
+                plan_mode = (
+                    "full" if reused_plans == 0 else
+                    "reuse" if reused_plans == len(dma_plans) else "mix"
+                )
+                for bank in range(len(dma_plans)):
                     if plan_cache[(kv_group, bank)].mapping_changed:
                         for cache_key in tuple(bound_loads):
                             if cache_key[0] == kv_group and cache_key[2] == bank:
@@ -5661,6 +5677,12 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                         )
                     with torch.npu.stream(bank_stream):
                         deferred_load_submitted = True
+                        overlap = getattr(self, "prefill_overlap_recorder", None)
+                        overlap_dma = (
+                            overlap.start_interval(
+                                "load", bank_stream, kv_group, bank, layer_id,
+                            ) if overlap is not None else None
+                        )
                         if diagnose_bank_load:
                             native_enqueue_started = time.perf_counter()
                         if prefill_packet:
@@ -5669,6 +5691,8 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                             )
                         else:
                             lmc_ops.layerwise_prefill_dma_copy(copies, False)
+                        if overlap is not None:
+                            overlap.end_interval(overlap_dma, bank_stream)
                         if diagnose_bank_load:
                             native_enqueue_ms = (
                                 time.perf_counter() - native_enqueue_started
@@ -7760,27 +7784,34 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         kv_group: int,
         bank_offset: Optional[int] = None,
         model_layer_id: Optional[int] = None,
+        bank_offsets: Optional[tuple[int, ...]] = None,
     ) -> None:
         """Order a layer consumer after its asynchronous P-node bank hand-off.
 
         With raw layerwise DMA, a completed load is already ordered after the
-        preceding save for its bank by the bank FIFO stream.  Join only that
-        load completion on the compute stream.  The old dense-direct fallback
-        retains its save fence because it has no bank FIFO stream; the raw DMA
-        path never joins a store event here.
+        preceding save for its bank by the bank FIFO stream. Join that load
+        completion on the compute stream. A bank with no load must instead
+        join its pending save before the consumer can overwrite its slots.
+
+        ``bank_offsets`` includes every scheduled request's phase, including
+        cache misses. Mixed batches wait only on the physical banks they use.
         """
         bank_counts, generations, _, load_done = (
             self._layerwise_prefill_transfer_state()
         )
         generation = generations.setdefault(int(kv_group), 0)
         current_stream = torch.npu.current_stream()
+        offsets = (
+            bank_offsets if bank_offsets is not None
+            else (bank_offset,) if bank_offset is not None else None
+        )
         selected_banks = (
-            (
+            tuple(sorted({
                 self._layerwise_prefill_bank(
-                    layer_id, kv_group, int(bank_offset)
-                ),
-            )
-            if bank_offset is not None
+                    layer_id, kv_group, int(offset)
+                ) for offset in offsets
+            }))
+            if offsets is not None
             else tuple(
                 range(
                     self._layerwise_prefill_transfer_state()[0].get(
@@ -7822,6 +7853,7 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
         # used by the current batch is required when requests are at different
         # chunk phases; the final event on each bank FIFO fences all loads for
         # that bank without a host-side query or synchronization.
+        bank_tails = getattr(self, "_layerwise_prefill_bank_tail_events", {})
         for selected_bank in selected_banks:
             load_record = load_done.pop(
                 (kv_group, int(layer_id), selected_bank), None
@@ -7832,19 +7864,12 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             if load_record is not None and load_record[0] == generation:
                 load_records.append((selected_bank, load_record[1]))
                 current_stream.wait_event(load_record[1])
-
-        if not load_records:
-            # A cache miss or a non-deferred layer has no load_done record. If
-            # the selected bank was used by the previous chunk, join its tail
-            # event before the layer can overwrite that bank. This is a device
-            # dependency only; no host synchronize is introduced.
-            bank_tails = getattr(
-                self, "_layerwise_prefill_bank_tail_events", {}
-            )
-            for selected_bank in selected_banks:
-                previous_tail = bank_tails.get((kv_group, selected_bank))
-                if previous_tail is None or previous_tail[0] != generation:
-                    continue
+                continue
+            # This bank may have a cache miss while another bank loads a hit.
+            # Only its own load event orders its preceding save; another bank's
+            # completion cannot protect these slots from N+B overwriting them.
+            previous_tail = bank_tails.get((kv_group, selected_bank))
+            if previous_tail is not None and previous_tail[0] == generation:
                 current_stream.wait_event(previous_tail[1])
         if overlap is not None:
             overlap.end_interval(overlap_wait, current_stream)
