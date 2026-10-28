@@ -3933,6 +3933,8 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
             )
             all_ptrs: List[List[int]] = []
             all_sizes: List[List[int]] = []
+            tensor_token_bytes = sum(token_bytes for _, token_bytes in tensor_meta)
+            metadata_token_bytes = sum(layout.layer_token_bytes) if c8 else 0
             for start, end in zip(starts, ends, strict=True):
                 local_start, local_end = start - slot_base, end - slot_base
                 if (
@@ -4002,11 +4004,9 @@ class VLLMPagedMemLayerwiseNPUConnector(DeviceConnectorInterface):
                                 sizes.append(count * token_bytes)
                     page_ptrs.append(ptrs)
                     page_sizes.append(sizes)
-                expected = sum(token_bytes for _, token_bytes in tensor_meta) * (
-                    end - start
-                )
+                expected = tensor_token_bytes * (end - start)
                 metadata_bytes = (
-                    sum(layout.layer_token_bytes) * (end - start)
+                    metadata_token_bytes * (end - start)
                     if c8
                     else (
                         self.get_shape(end - start, kv_group).numel()
